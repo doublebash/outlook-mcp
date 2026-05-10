@@ -1,6 +1,25 @@
 import type { Env, TokenData } from './types';
 
+// ── Single-flight refresh mutex contract ──────────────────────────────────────
+// Microsoft Graph rolls refresh tokens: when /oauth2/v2.0/token returns a new
+// refresh_token, the previously issued one is invalidated. If two callers race
+// on an expired access token and both POST a refresh, the slower caller ends
+// up holding a dead refresh_token and the user is forced through /oauth/start.
+//
+// We serialise refreshes via a KV mutex on `<TOKENS_KEY>:refresh_lock`. The
+// lock value is a per-caller UUID so only the holder can release it. Cloudflare
+// KV is last-write-wins — there is no native CAS — so after `put` we re-`get`
+// and verify our UUID won. Losers wait briefly and re-read tokens; if the
+// winner already refreshed, they reuse the fresh access token instead of
+// triggering a second refresh. The lock auto-expires after 30s in case the
+// holder dies mid-refresh.
+
 const TOKENS_KEY = 'oauth_tokens';
+const REFRESH_LOCK_KEY = `${TOKENS_KEY}:refresh_lock`;
+const LOCK_TTL_SECONDS = 30;
+const WAIT_INTERVAL_MS = 200;
+const MAX_WAIT_ATTEMPTS = 25; // 25 × 200ms ≈ 5s before giving up
+const REFRESH_SKEW_MS = 5 * 60 * 1000; // refresh proactively within 5min of expiry
 
 // ── Token encryption (AES-256-GCM) ────────────────────────────────────────────
 // Tokens are encrypted at rest in KV so a KV namespace compromise does not
@@ -99,6 +118,10 @@ export async function saveTokens(env: Env, tokens: TokenData): Promise<void> {
 
 // ── Access token helpers ───────────────────────────────────────────────────────
 
+function isExpiringSoon(tokens: TokenData): boolean {
+  return Date.now() >= tokens.expires_at - REFRESH_SKEW_MS;
+}
+
 // Returns a valid access token, refreshing automatically if needed
 export async function getValidAccessToken(env: Env): Promise<string> {
   const tokens = await getTokens(env);
@@ -106,13 +129,80 @@ export async function getValidAccessToken(env: Env): Promise<string> {
     throw new Error('Not authenticated. Visit /oauth/start in your browser to log in.');
   }
 
-  // Refresh proactively if within 5 minutes of expiry
-  const fiveMinutes = 5 * 60 * 1000;
-  if (Date.now() >= tokens.expires_at - fiveMinutes) {
-    return refreshAccessToken(env, tokens.refresh_token);
+  if (!isExpiringSoon(tokens)) {
+    return tokens.access_token;
   }
 
-  return tokens.access_token;
+  return refreshWithLock(env);
+}
+
+// ── Refresh mutex ──────────────────────────────────────────────────────────────
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Try to claim the refresh lock. Returns our lock token on success, null if
+// another caller already owns it or beat us in the last-write-wins race.
+async function acquireRefreshLock(env: Env): Promise<string | null> {
+  const existing = await env.OAUTH_KV.get(REFRESH_LOCK_KEY);
+  if (existing) return null;
+
+  const myToken = crypto.randomUUID();
+  await env.OAUTH_KV.put(REFRESH_LOCK_KEY, myToken, { expirationTtl: LOCK_TTL_SECONDS });
+
+  // KV has no CAS — re-read and confirm we still own the lock.
+  const winner = await env.OAUTH_KV.get(REFRESH_LOCK_KEY);
+  return winner === myToken ? myToken : null;
+}
+
+// Release the lock only if we still hold it (TTL may have expired and another
+// caller may have already taken over).
+async function releaseRefreshLock(env: Env, lockToken: string): Promise<void> {
+  const current = await env.OAUTH_KV.get(REFRESH_LOCK_KEY);
+  if (current === lockToken) {
+    await env.OAUTH_KV.delete(REFRESH_LOCK_KEY).catch(() => {});
+  }
+}
+
+async function refreshWithLock(env: Env): Promise<string> {
+  for (let attempt = 0; attempt < MAX_WAIT_ATTEMPTS; attempt++) {
+    const lockToken = await acquireRefreshLock(env);
+
+    if (lockToken) {
+      try {
+        // Re-read inside the lock — another caller may have refreshed between
+        // our initial getTokens and lock acquisition. Always use the freshest
+        // refresh_token from KV; using a stale one would invalidate the live one.
+        const fresh = await getTokens(env);
+        if (!fresh) {
+          throw new Error('Not authenticated. Visit /oauth/start in your browser to log in.');
+        }
+        if (!isExpiringSoon(fresh)) {
+          return fresh.access_token;
+        }
+        return await refreshAccessToken(env, fresh.refresh_token);
+      } finally {
+        await releaseRefreshLock(env, lockToken);
+      }
+    }
+
+    // Lost the race / lock held by someone else. Wait, then check whether the
+    // winner has already refreshed for us.
+    await sleep(WAIT_INTERVAL_MS);
+    const fresh = await getTokens(env);
+    if (fresh && !isExpiringSoon(fresh)) {
+      return fresh.access_token;
+    }
+  }
+
+  // Don't fall through and refresh ourselves — that's exactly the race the
+  // mutex exists to prevent. The lock auto-expires after 30s, so a retry
+  // shortly will succeed.
+  throw new Error(
+    'Token refresh timed out waiting for another in-flight refresh. ' +
+    'Retry shortly; if this persists, visit /oauth/start to re-authenticate.'
+  );
 }
 
 // ── Token refresh ──────────────────────────────────────────────────────────────
