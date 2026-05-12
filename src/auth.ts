@@ -11,12 +11,14 @@ import type { Env, TokenData } from './types';
 // KV is last-write-wins — there is no native CAS — so after `put` we re-`get`
 // and verify our UUID won. Losers wait briefly and re-read tokens; if the
 // winner already refreshed, they reuse the fresh access token instead of
-// triggering a second refresh. The lock auto-expires after 30s in case the
-// holder dies mid-refresh.
+// triggering a second refresh. The lock auto-expires after 60s in case the
+// holder dies mid-refresh. (60s is Cloudflare KV's minimum expirationTtl; a
+// refresh normally completes in <5s, so the only effect of the floor is how
+// long a dead holder blocks new refresh attempts.)
 
 const TOKENS_KEY = 'oauth_tokens';
 const REFRESH_LOCK_KEY = `${TOKENS_KEY}:refresh_lock`;
-const LOCK_TTL_SECONDS = 30;
+const LOCK_TTL_SECONDS = 60;
 const WAIT_INTERVAL_MS = 200;
 const MAX_WAIT_ATTEMPTS = 25; // 25 × 200ms ≈ 5s before giving up
 const REFRESH_SKEW_MS = 5 * 60 * 1000; // refresh proactively within 5min of expiry
