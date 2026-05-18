@@ -13,6 +13,15 @@ export function htmlToText(html: string): string {
     .replace(/&gt;/gi, '>')
     .replace(/&quot;/gi, '"')
     .replace(/&#39;|&apos;/gi, "'")
+    // Decode numeric entities (decimal + hex) for inbound display
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
+      const cp = parseInt(hex, 16);
+      return Number.isFinite(cp) && cp < 0x10000 ? String.fromCharCode(cp) : '';
+    })
+    .replace(/&#(\d+);/g, (_, dec) => {
+      const cp = parseInt(dec, 10);
+      return Number.isFinite(cp) && cp < 0x10000 ? String.fromCharCode(cp) : '';
+    })
     .replace(/&[a-z]+;/gi, '')
     .replace(/[ \t]+/g, ' ')
     .replace(/\n[ \t]+/g, '\n')

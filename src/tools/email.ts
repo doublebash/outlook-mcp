@@ -1,0 +1,556 @@
+import { ToolError, defineTools } from "@bashco/mcp-toolkit";
+import { z } from "zod";
+import { PR_DEFERRED_SEND_TIME } from "../calendar-helpers.js";
+import {
+	buildMessageBody,
+	buildRecipients,
+	resolveAndValidateAttachments,
+} from "../email-helpers.js";
+import { graphDelete, graphGet, graphPatch, graphPost } from "../graph.js";
+import { sanitizeEmailFull, sanitizeEmailList } from "../sanitize.js";
+import type { Env } from "../types.js";
+import {
+	ATTACHMENTS_DESC,
+	BODY_TYPE_DESC,
+	attachmentSchema,
+	auditLog,
+	escapeOdataString,
+	summariseAttachmentSources,
+} from "./_shared.js";
+
+// ── Schemas ────────────────────────────────────────────────────────────────────
+
+const bodyTypeSchema = z.enum(["text", "html"]).optional();
+// Folder is interpolated into a URL path. Restrict to well-known names or
+// Graph folder IDs (alphanumeric + `_-=` for base64url padding).
+const folderSchema = z
+	.string()
+	.regex(/^[A-Za-z0-9_=\-]+$/, "folder must be a well-known name or folder ID")
+	.max(256)
+	.optional();
+const emailIdSchema = z.string().min(1).max(512);
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+// Build the Graph "message" object from common args. Attachments are NOT
+// included here — they are uploaded separately via uploadAttachmentsToDraft
+// because they may need server-side fetching (OneDrive / URL).
+function buildMessageObject(args: {
+	to?: string;
+	cc?: string;
+	bcc?: string;
+	subject?: string;
+	body?: string;
+	body_type?: string;
+}): Record<string, unknown> {
+	const message: Record<string, unknown> = {};
+	if (args.subject !== undefined) message.subject = args.subject;
+	if (args.body !== undefined) {
+		message.body = buildMessageBody(args.body, args.body_type);
+	}
+	if (args.to !== undefined) message.toRecipients = buildRecipients(args.to);
+	const cc = buildRecipients(args.cc);
+	const bcc = buildRecipients(args.bcc);
+	if (cc.length) message.ccRecipients = cc;
+	if (bcc.length) message.bccRecipients = bcc;
+	return message;
+}
+
+async function uploadAttachmentsToDraft(
+	env: Env,
+	draftId: string,
+	attachmentsRaw: unknown,
+): Promise<void> {
+	const attachments = await resolveAndValidateAttachments(env, attachmentsRaw);
+	for (const att of attachments) {
+		await graphPost(env, `/me/messages/${draftId}/attachments`, att);
+	}
+}
+
+// ── Impls ──────────────────────────────────────────────────────────────────────
+
+async function listEmailsImpl(
+	env: Env,
+	args: { count?: number; folder?: string; search?: string },
+): Promise<unknown> {
+	const count = Math.min(args.count ?? 20, 50);
+	const folder = args.folder ?? "inbox";
+	const selectFields =
+		"id,conversationId,subject,from,receivedDateTime,bodyPreview,isRead,isDraft";
+
+	if (args.search) {
+		// Note: /me/messages?$search is keyword-based. We DON'T combine with
+		// $orderby here because Graph requires the advanced-query opt-in for that
+		// combination and behaviour varies by tenant.
+		const data = (await graphGet(env, "/me/messages", {
+			$search: `"${args.search.replace(/"/g, "")}"`,
+			$select: selectFields,
+			$top: count,
+		})) as { value: unknown[] };
+		return sanitizeEmailList(data.value);
+	}
+	const data = (await graphGet(env, `/me/mailFolders/${folder}/messages`, {
+		$select: selectFields,
+		$top: count,
+		$orderby: "receivedDateTime desc",
+	})) as { value: unknown[] };
+	return sanitizeEmailList(data.value);
+}
+
+async function readEmailImpl(env: Env, args: { id: string }): Promise<unknown> {
+	const data = await graphGet(env, `/me/messages/${args.id}`, {
+		$select:
+			"id,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,body,hasAttachments,isDraft",
+	});
+	return sanitizeEmailFull(data);
+}
+
+async function sendEmailImpl(
+	env: Env,
+	args: {
+		to: string;
+		subject: string;
+		body: string;
+		body_type?: string;
+		cc?: string;
+		bcc?: string;
+		attachments?: unknown[];
+	},
+): Promise<unknown> {
+	// If the message has attachments we must use the create-draft-then-send
+	// pattern, because /me/sendMail enforces a 4 MB total request cap. Drafts
+	// can have attachments uploaded individually and are not subject to that
+	// single-request cap.
+	const hasAttachments = Array.isArray(args.attachments) && args.attachments.length > 0;
+
+	if (!hasAttachments) {
+		await graphPost(env, "/me/sendMail", { message: buildMessageObject(args) });
+		auditLog("email_sent", { to: args.to, subject: args.subject, attachments: 0 });
+		return { success: true, message: "Email sent." };
+	}
+
+	const draft = (await graphPost(env, "/me/messages", buildMessageObject(args))) as {
+		id: string;
+	};
+	await uploadAttachmentsToDraft(env, draft.id, args.attachments);
+	await graphPost(env, `/me/messages/${draft.id}/send`);
+	auditLog("email_sent", {
+		to: args.to,
+		subject: args.subject,
+		attachments: args.attachments!.length,
+		attachment_sources: summariseAttachmentSources(args.attachments),
+	});
+	return { success: true, message: "Email sent." };
+}
+
+async function replyToEmailImpl(
+	env: Env,
+	args: {
+		id: string;
+		body: string;
+		body_type?: string;
+		reply_all?: boolean;
+		attachments?: unknown[];
+	},
+): Promise<unknown> {
+	const action = args.reply_all ? "createReplyAll" : "createReply";
+	const draft = (await graphPost(env, `/me/messages/${args.id}/${action}`)) as {
+		id: string;
+	};
+
+	const body = buildMessageBody(args.body, args.body_type);
+	await graphPatch(env, `/me/messages/${draft.id}`, { body });
+
+	if (args.attachments && args.attachments.length > 0) {
+		await uploadAttachmentsToDraft(env, draft.id, args.attachments);
+	}
+
+	await graphPost(env, `/me/messages/${draft.id}/send`);
+	auditLog("reply_sent", {
+		in_reply_to: args.id,
+		reply_all: !!args.reply_all,
+		attachments: args.attachments?.length ?? 0,
+		attachment_sources: summariseAttachmentSources(args.attachments),
+	});
+	return { success: true, message: "Reply sent." };
+}
+
+async function forwardEmailImpl(
+	env: Env,
+	args: {
+		id: string;
+		to: string;
+		body?: string;
+		body_type?: string;
+		cc?: string;
+		bcc?: string;
+		attachments?: unknown[];
+	},
+): Promise<unknown> {
+	const draft = (await graphPost(env, `/me/messages/${args.id}/createForward`)) as {
+		id: string;
+	};
+
+	const updates: Record<string, unknown> = {
+		toRecipients: buildRecipients(args.to),
+	};
+	const cc = buildRecipients(args.cc);
+	const bcc = buildRecipients(args.bcc);
+	if (cc.length) updates.ccRecipients = cc;
+	if (bcc.length) updates.bccRecipients = bcc;
+	if (args.body) {
+		updates.body = buildMessageBody(args.body, args.body_type);
+	}
+	await graphPatch(env, `/me/messages/${draft.id}`, updates);
+
+	if (args.attachments && args.attachments.length > 0) {
+		await uploadAttachmentsToDraft(env, draft.id, args.attachments);
+	}
+
+	await graphPost(env, `/me/messages/${draft.id}/send`);
+	auditLog("email_forwarded", {
+		forwarded_from: args.id,
+		to: args.to,
+		additional_attachments: args.attachments?.length ?? 0,
+		attachment_sources: summariseAttachmentSources(args.attachments),
+	});
+	return { success: true, message: "Email forwarded." };
+}
+
+async function deleteEmailImpl(env: Env, args: { id: string }): Promise<unknown> {
+	await graphDelete(env, `/me/messages/${args.id}`);
+	return { success: true, message: "Email deleted." };
+}
+
+async function moveEmailImpl(
+	env: Env,
+	args: { id: string; destination_folder: string },
+): Promise<unknown> {
+	const data = (await graphPost(env, `/me/messages/${args.id}/move`, {
+		destinationId: args.destination_folder,
+	})) as { id: string };
+	return { success: true, message: "Email moved.", new_id: data.id };
+}
+
+async function createDraftImpl(
+	env: Env,
+	args: {
+		to?: string;
+		subject: string;
+		body: string;
+		body_type?: string;
+		cc?: string;
+		bcc?: string;
+		attachments?: unknown[];
+	},
+): Promise<unknown> {
+	const draft = (await graphPost(env, "/me/messages", buildMessageObject(args))) as {
+		id: string;
+		webLink?: string;
+	};
+
+	if (args.attachments && args.attachments.length > 0) {
+		await uploadAttachmentsToDraft(env, draft.id, args.attachments);
+	}
+
+	auditLog("draft_created", {
+		draft_id: draft.id,
+		to: args.to,
+		subject: args.subject,
+		attachments: args.attachments?.length ?? 0,
+		attachment_sources: summariseAttachmentSources(args.attachments),
+	});
+	return {
+		success: true,
+		message: "Draft created.",
+		draft_id: draft.id,
+		webLink: draft.webLink,
+	};
+}
+
+async function updateDraftImpl(
+	env: Env,
+	args: {
+		id: string;
+		to?: string;
+		subject?: string;
+		body?: string;
+		body_type?: string;
+		cc?: string;
+		bcc?: string;
+		attachments?: unknown[];
+	},
+): Promise<unknown> {
+	const updates = buildMessageObject(args);
+	let didChange = false;
+
+	if (Object.keys(updates).length > 0) {
+		await graphPatch(env, `/me/messages/${args.id}`, updates);
+		didChange = true;
+	}
+
+	if (args.attachments !== undefined) {
+		const existing = (await graphGet(
+			env,
+			`/me/messages/${args.id}/attachments`,
+			{ $select: "id" },
+		)) as { value: Array<{ id: string }> };
+		for (const a of existing.value) {
+			await graphDelete(env, `/me/messages/${args.id}/attachments/${a.id}`);
+		}
+		if (args.attachments.length > 0) {
+			await uploadAttachmentsToDraft(env, args.id, args.attachments);
+		}
+		didChange = true;
+	}
+
+	if (!didChange) {
+		throw ToolError.validation(
+			"No fields provided to update. Pass at least one of: subject, body, to, cc, bcc, attachments.",
+		);
+	}
+
+	auditLog("draft_updated", {
+		draft_id: args.id,
+		fields_updated: Object.keys(updates),
+		attachments_replaced: args.attachments !== undefined,
+	});
+	return { success: true, message: "Draft updated." };
+}
+
+async function sendDraftImpl(env: Env, args: { id: string }): Promise<unknown> {
+	await graphPost(env, `/me/messages/${args.id}/send`);
+	auditLog("draft_sent", { draft_id: args.id });
+	return { success: true, message: "Draft sent." };
+}
+
+async function scheduleSendImpl(
+	env: Env,
+	args: {
+		to: string;
+		subject: string;
+		body: string;
+		body_type?: string;
+		cc?: string;
+		bcc?: string;
+		attachments?: unknown[];
+		send_at: string;
+	},
+): Promise<unknown> {
+	const sendAtDate = new Date(args.send_at);
+	if (Number.isNaN(sendAtDate.getTime())) {
+		throw ToolError.validation("send_at is not a valid ISO 8601 datetime");
+	}
+	if (sendAtDate.getTime() <= Date.now()) {
+		throw ToolError.validation("send_at must be in the future");
+	}
+
+	const message = buildMessageObject(args);
+	message.singleValueExtendedProperties = [
+		{ id: PR_DEFERRED_SEND_TIME, value: sendAtDate.toISOString() },
+	];
+
+	const draft = (await graphPost(env, "/me/messages", message)) as { id: string };
+
+	if (args.attachments && args.attachments.length > 0) {
+		await uploadAttachmentsToDraft(env, draft.id, args.attachments);
+	}
+
+	await graphPost(env, `/me/messages/${draft.id}/send`);
+	auditLog("scheduled_send", {
+		draft_id: draft.id,
+		send_at: sendAtDate.toISOString(),
+		to: args.to,
+		subject: args.subject,
+		attachments: args.attachments?.length ?? 0,
+		attachment_sources: summariseAttachmentSources(args.attachments),
+	});
+	return {
+		success: true,
+		message: `Email scheduled for ${sendAtDate.toISOString()}. The mail server will hold it until then.`,
+		scheduled_id: draft.id,
+	};
+}
+
+async function getConversationImpl(
+	env: Env,
+	args: { conversation_id?: string; message_id?: string; count?: number },
+): Promise<unknown> {
+	let conversationId = args.conversation_id;
+	if (!conversationId) {
+		if (!args.message_id) {
+			throw ToolError.validation("Either conversation_id or message_id is required");
+		}
+		const msg = (await graphGet(env, `/me/messages/${args.message_id}`, {
+			$select: "conversationId",
+		})) as { conversationId?: string };
+		if (!msg.conversationId)
+			throw ToolError.validation("Could not resolve conversationId from message");
+		conversationId = msg.conversationId;
+	}
+
+	const count = args.count ?? 50;
+	const safeId = escapeOdataString(conversationId);
+	// `ConsistencyLevel: eventual` enables server-side $orderby combined with
+	// $filter — the advanced-query opt-in Microsoft Graph requires.
+	const data = (await graphGet(
+		env,
+		"/me/messages",
+		{
+			$filter: `conversationId eq '${safeId}'`,
+			$select:
+				"id,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,body,hasAttachments,isDraft",
+			$top: count,
+			$orderby: "receivedDateTime asc",
+		},
+		{ ConsistencyLevel: "eventual" },
+	)) as { value: unknown[] };
+
+	return {
+		conversationId,
+		count: data.value.length,
+		messages: data.value.map((m) => sanitizeEmailFull(m)),
+	};
+}
+
+// ── defineTools map ────────────────────────────────────────────────────────────
+
+export const emailTools = defineTools<Env>({
+	list_emails: {
+		description:
+			"Retrieve recent emails. Supports folder selection and keyword search.",
+		schema: z.object({
+			count: z.number().int().min(1).max(50).optional(),
+			folder: folderSchema,
+			search: z.string().min(1).max(256).optional(),
+		}),
+		handler: (env, args) => listEmailsImpl(env, args),
+	},
+	read_email: {
+		description: "Read the full content of an email by its ID.",
+		schema: z.object({ id: emailIdSchema }),
+		handler: (env, args) => readEmailImpl(env, args),
+	},
+	send_email: {
+		description:
+			"Send a new email. Supports plain text or HTML body, attachments, and inline images.",
+		schema: z.object({
+			to: z.string().min(1).max(2048),
+			subject: z.string().min(1).max(998),
+			body: z.string().max(2 * 1024 * 1024),
+			body_type: bodyTypeSchema,
+			cc: z.string().max(2048).optional(),
+			bcc: z.string().max(2048).optional(),
+			attachments: z.array(attachmentSchema).max(20).optional(),
+		}),
+		handler: (env, args) => sendEmailImpl(env, args),
+	},
+	reply_to_email: {
+		description:
+			"Reply to an email. Supports plain text or HTML, attachments, and inline images.",
+		schema: z.object({
+			id: emailIdSchema,
+			body: z.string().max(2 * 1024 * 1024),
+			body_type: bodyTypeSchema,
+			reply_all: z.boolean().optional(),
+			attachments: z.array(attachmentSchema).max(20).optional(),
+		}),
+		handler: (env, args) => replyToEmailImpl(env, args),
+	},
+	forward_email: {
+		description:
+			"Forward an email to new recipients. The original message and its attachments are included automatically; you can add an optional comment above and additional attachments.",
+		schema: z.object({
+			id: emailIdSchema,
+			to: z.string().min(1).max(2048),
+			body: z.string().max(2 * 1024 * 1024).optional(),
+			body_type: bodyTypeSchema,
+			cc: z.string().max(2048).optional(),
+			bcc: z.string().max(2048).optional(),
+			attachments: z.array(attachmentSchema).max(20).optional(),
+		}),
+		handler: (env, args) => forwardEmailImpl(env, args),
+	},
+	delete_email: {
+		description: "Delete an email (moves it to the Deleted Items folder).",
+		schema: z.object({ id: emailIdSchema }),
+		handler: (env, args) => deleteEmailImpl(env, args),
+	},
+	move_email: {
+		description: "Move an email to a different folder.",
+		schema: z.object({
+			id: emailIdSchema,
+			destination_folder: z
+				.string()
+				.regex(/^[A-Za-z0-9_=\-]+$/, "folder must be a well-known name or folder ID")
+				.max(256),
+		}),
+		handler: (env, args) => moveEmailImpl(env, args),
+	},
+	create_draft: {
+		description:
+			"Create a new email draft (saved but not sent). Returns the draft ID for later editing or sending.",
+		schema: z.object({
+			to: z.string().min(1).max(2048).optional(),
+			subject: z.string().min(1).max(998),
+			body: z.string().max(2 * 1024 * 1024),
+			body_type: bodyTypeSchema,
+			cc: z.string().max(2048).optional(),
+			bcc: z.string().max(2048).optional(),
+			attachments: z.array(attachmentSchema).max(20).optional(),
+		}),
+		handler: (env, args) => createDraftImpl(env, args),
+	},
+	update_draft: {
+		description:
+			"Update an existing draft email. Only provide the fields you want to change. To replace attachments, provide the full new attachment list (existing attachments will be removed first). Empty calls (no fields provided) are rejected.",
+		schema: z.object({
+			id: emailIdSchema,
+			to: z.string().max(2048).optional(),
+			subject: z.string().max(998).optional(),
+			body: z.string().max(2 * 1024 * 1024).optional(),
+			body_type: bodyTypeSchema,
+			cc: z.string().max(2048).optional(),
+			bcc: z.string().max(2048).optional(),
+			attachments: z.array(attachmentSchema).max(20).optional(),
+		}),
+		handler: (env, args) => updateDraftImpl(env, args),
+	},
+	send_draft: {
+		description: "Send an existing draft email by its ID.",
+		schema: z.object({ id: emailIdSchema }),
+		handler: (env, args) => sendDraftImpl(env, args),
+	},
+	schedule_send: {
+		description:
+			"Send an email at a future date/time. The Microsoft 365 mail server holds the message until the scheduled time. Same options as send_email plus a send_at datetime.",
+		schema: z.object({
+			to: z.string().min(1).max(2048),
+			subject: z.string().min(1).max(998),
+			body: z.string().max(2 * 1024 * 1024),
+			body_type: bodyTypeSchema,
+			cc: z.string().max(2048).optional(),
+			bcc: z.string().max(2048).optional(),
+			attachments: z.array(attachmentSchema).max(20).optional(),
+			send_at: z.string().min(1).max(64),
+		}),
+		handler: (env, args) => scheduleSendImpl(env, args),
+	},
+	get_conversation: {
+		description:
+			"Get all messages in an email thread (conversation), oldest first. Returns messages from across all folders (inbox, sent, archive, etc.). Pass either a conversation_id or a message_id from any email in the thread.",
+		schema: z
+			.object({
+				conversation_id: z.string().min(1).max(512).optional(),
+				message_id: z.string().min(1).max(512).optional(),
+				count: z.number().int().min(1).max(200).optional(),
+			})
+			.refine((d) => !!(d.conversation_id || d.message_id), {
+				message: "Provide either conversation_id or message_id",
+			}),
+		handler: (env, args) => getConversationImpl(env, args),
+	},
+});
+
+// Re-export tool descriptions so the tool file is self-contained for tests.
+export { ATTACHMENTS_DESC, BODY_TYPE_DESC };
