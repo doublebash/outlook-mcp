@@ -1,249 +1,205 @@
 # Outlook MCP Server
 
-**Status:** Live  
-**Built:** April 2026  
-**Worker URL:** https://outlook-mcp.bashar-basheer.workers.dev  
-**Project folder:** `/Users/basheerco/Documents/AI Agents & Workflows/Outlook-MCP/outlook-mcp`
+A **Model Context Protocol** server bridging Claude to **Microsoft Outlook** (email, calendar, contacts, tasks, files), deployed on **Cloudflare Workers**.
 
----
+Fork this repo, deploy to your own Cloudflare account, register a Microsoft Azure AD app, point Claude.ai at your worker, and Claude can read and write your Microsoft 365 data through natural language.
 
-## What this is
+Built on [`@bashco/mcp-toolkit`](https://github.com/doublebash/mcp-toolkit) — OAuth, per-client bearer tokens, rate limiting, structured logging, typed tool dispatch are all handled by the shared library.
 
-A custom MCP (Model Context Protocol) server that connects Claude directly to your Microsoft Outlook account. It gives Claude full read and write access to your email, calendar, contacts, tasks, mailbox settings, and OneDrive — all controlled through natural language in Claude Desktop.
+## What Claude gets — 28 tools across 6 domains
 
-This is not a plugin or third-party integration. It is infrastructure you own and control, hosted on your own Cloudflare account, authenticated against your own Microsoft Azure app registration.
+- **Mail**: list emails, read email, search, reply, forward, delete, send, move between folders, create draft, update draft, send draft, schedule send
+- **Calendar**: list events, list event occurrences, create, update, delete, cancel event, respond to event
+- **Contacts**: list, create contact
+- **Tasks**: list task lists, list tasks, create task
+- **Files**: list files, share file
+- **Conversation**: get conversation (full thread)
+- **Settings**: get mailbox settings, set out-of-office
 
----
+Full live catalogue at the `tools/list` MCP endpoint after deploy.
 
-## What Claude can do with it
+## How auth works
 
-### Email
-- List recent emails from any folder (inbox, sent, drafts, subfolders)
-- Read the full content of any email
-- Send new emails with CC and BCC
-- Reply to emails (reply or reply all)
-- Delete emails
-- Move emails between folders
-- Search across all mail
+Two layers:
 
-### Calendar
-- List upcoming events within any date range
-- Create events with title, time, timezone, location, description, and attendees
-- Update existing events (time, location, attendees, description)
-- Delete events
-- Invite or remove attendees by providing an updated attendee list
+1. **Claude.ai ↔ your worker** — standard MCP OAuth 2.0 + PKCE flow. Each Claude client gets a unique bearer token; your `MCP_APPROVAL_CODE` is what *you* paste at `/authorize` once to mint that bearer.
+2. **Your worker ↔ Microsoft Graph** — proxied OAuth. You authorise Microsoft *once* by visiting `/oauth/start` on your deployed worker; refresh tokens are stored encrypted at rest in Cloudflare KV. Refresh happens automatically.
 
-### Contacts
-- List and search your Outlook address book
-- Create new contacts with name, email, phone, company, and job title
+## Setup — deploy your own copy
 
-### Tasks (Microsoft To Do)
-- List all task lists
-- List tasks (filtered by status)
-- Create tasks with due dates, notes, and priority
+### Prerequisites
 
-### Mailbox Settings
-- Read your current settings (timezone, working hours, out-of-office status)
-- Enable or disable out-of-office replies with custom internal and external messages
-- Schedule out-of-office with start and end times
+- A [Cloudflare account](https://dash.cloudflare.com/sign-up) (free plan works)
+- [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/install-and-update/) installed and logged in (`wrangler login`)
+- Node.js 22+
+- A Microsoft account (personal, work, or school) with access to register Azure AD apps at [entra.microsoft.com](https://entra.microsoft.com)
 
-### OneDrive
-- List files and folders (by path)
-- Generate shareable links (view or edit, anonymous or organisation-scoped)
+### 1. Fork and clone
 
----
-
-## How it works
-
-```
-Claude Desktop
-      │
-      │  stdio (JSON-RPC)
-      ▼
-proxy.mjs  ← local Node.js bridge script
-      │
-      │  HTTPS POST
-      ▼
-Cloudflare Worker  (outlook-mcp.bashar-basheer.workers.dev)
-      │                    │
-      │                    ├── Cloudflare KV  ← stores OAuth tokens
-      │
-      │  HTTPS (Bearer token)
-      ▼
-Microsoft Graph API  (graph.microsoft.com)
-      │
-      ▼
-Your Outlook account
-```
-
-### Step by step
-
-1. Claude Desktop spawns `proxy.mjs` as a local child process when it starts
-2. Claude sends a JSON-RPC message over stdio to the proxy
-3. The proxy forwards it as an HTTPS POST to the Cloudflare Worker's `/mcp` endpoint
-4. The Worker looks up your OAuth access token from Cloudflare KV
-5. If the token is within 5 minutes of expiring, it automatically refreshes it using the stored refresh token
-6. The Worker calls the Microsoft Graph API on your behalf using the access token
-7. The Graph API response is sanitised (HTML stripped, fields flattened) and returned to Claude
-8. Claude reads the clean response and replies to you
-
----
-
-## Where everything lives
-
-### Cloudflare (cloud)
-| Resource | Details |
-|---|---|
-| Worker | `outlook-mcp` — handles all requests |
-| KV Namespace | `OAUTH_KV` (ID: `4994370056d545869e91491b115753fc`) — stores tokens |
-| Worker URL | `https://outlook-mcp.bashar-basheer.workers.dev` |
-| Dashboard | https://dash.cloudflare.com → Workers & Pages → outlook-mcp |
-
-### Microsoft Azure (cloud)
-| Resource | Details |
-|---|---|
-| App name | Outlook MCP Server |
-| Client ID | `d36110b9-d68d-4e3c-b611-e31aaae38f94` |
-| Tenant ID | `5fa1667c-fd27-4b4d-8a8a-bf5e9e38c626` |
-| Redirect URI | `https://outlook-mcp.bashar-basheer.workers.dev/oauth/callback` |
-| Portal | https://portal.azure.com → Microsoft Entra ID → App registrations |
-
-> ⚠️ The Client Secret value is stored as an encrypted Wrangler secret in Cloudflare. It is not stored in any file. If it expires (set for 24 months), generate a new one in Azure and re-run `wrangler secret put MICROSOFT_CLIENT_SECRET` from the project folder.
-
-> 🔒 The `/mcp` endpoint is protected by a shared secret (`MCP_SECRET`). Unauthenticated requests receive a 401. The secret is stored in Cloudflare encrypted secrets and passed to the local proxy via the `env` block in `claude_desktop_config.json`. To rotate it: generate a new value with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`, run `wrangler secret put MCP_SECRET`, and update `claude_desktop_config.json`.
-
-### Local machine
-| File | Purpose |
-|---|---|
-| `outlook-mcp/src/index.ts` | Worker entry point — URL routing |
-| `outlook-mcp/src/auth.ts` | OAuth token storage and refresh logic |
-| `outlook-mcp/src/graph.ts` | Microsoft Graph API fetch wrapper |
-| `outlook-mcp/src/tools.ts` | All 19 tool schemas and handler functions |
-| `outlook-mcp/src/mcp.ts` | MCP JSON-RPC protocol dispatcher |
-| `outlook-mcp/src/sanitize.ts` | Strips HTML and cleans Graph API responses |
-| `outlook-mcp/src/types.ts` | TypeScript interfaces (Env, TokenData) |
-| `outlook-mcp/wrangler.jsonc` | Worker config — KV binding, env vars |
-| `outlook-mcp/proxy.mjs` | Local stdio ↔ HTTP bridge for Claude Desktop |
-| `claude_desktop_config.json` | Claude Desktop MCP server registration |
-
----
-
-## Permissions granted
-
-The following Microsoft Graph API delegated permissions are active:
-
-| Permission | What it allows |
-|---|---|
-| `Mail.ReadWrite` | Read and write all mail in all folders |
-| `Mail.Send` | Send email |
-| `Calendars.ReadWrite` | Full calendar access |
-| `Files.ReadWrite.All` | Full OneDrive access |
-| `Contacts.ReadWrite` | Read and write contacts |
-| `MailboxSettings.ReadWrite` | Read and write mailbox settings including OOO |
-| `Tasks.ReadWrite` | Read and write Microsoft To Do tasks |
-| `Sites.Read.All` | Read SharePoint sites and OneDrive for Business |
-| `offline_access` | Allows refresh tokens (stay authenticated) |
-| `User.Read` | Read basic profile info |
-
----
-
-## Maintenance
-
-### Re-authenticate (if tokens expire or break)
-Visit this URL in your browser and log in with your Microsoft account:
-```
-https://outlook-mcp.bashar-basheer.workers.dev/oauth/start
-```
-
-Check authentication status at any time:
-```
-https://outlook-mcp.bashar-basheer.workers.dev/oauth/status
-```
-
-### Deploy changes to the Worker
 ```bash
-cd "/Users/basheerco/Documents/AI Agents & Workflows/Outlook-MCP/outlook-mcp"
-wrangler deploy
+git clone https://github.com/<your-username>/outlook-mcp
+cd outlook-mcp
+npm install
 ```
 
-### Check Worker logs (live)
+### 2. Create the KV namespace
+
 ```bash
-cd "/Users/basheerco/Documents/AI Agents & Workflows/Outlook-MCP/outlook-mcp"
-wrangler tail --format=pretty
+wrangler kv:namespace create OAUTH_KV
 ```
 
-### Rotate the Client Secret
-1. Go to Azure portal → Microsoft Entra ID → App registrations → Outlook MCP Server → Certificates & secrets
-2. Delete the old secret, create a new one, copy the value immediately
-3. Run:
+Wrangler prints something like:
+
+```
+🌀 Creating namespace with title "outlook-mcp-OAUTH_KV"
+✨ Success! Add the following to your configuration file:
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "abc123def456..."
+```
+
+Edit `wrangler.jsonc` and replace the existing `id` under `kv_namespaces` with what wrangler just printed.
+
+### 3. Register a Microsoft Azure AD app
+
+1. Go to [entra.microsoft.com → Identity → Applications → App registrations → New registration](https://entra.microsoft.com)
+2. **Name**: anything (e.g. "Claude Outlook MCP")
+3. **Supported account types**:
+   - "Accounts in this organizational directory only" if you want to restrict to one tenant
+   - "Accounts in any organizational directory and personal Microsoft accounts" for the broadest support
+4. **Redirect URI**: leave blank for now — you'll come back after Step 6
+5. Click Register
+6. From the app's Overview page, record:
+   - **Application (client) ID** → this is your `MICROSOFT_CLIENT_ID`
+   - **Directory (tenant) ID** → this is your `MICROSOFT_TENANT_ID` (or use the string `common` for multi-tenant + personal account support)
+7. **API permissions** → Add the following Microsoft Graph delegated permissions:
+   - `Mail.ReadWrite`, `Mail.Send`
+   - `Calendars.ReadWrite`
+   - `Contacts.ReadWrite`
+   - `Tasks.ReadWrite`
+   - `Files.Read.All` (or `Files.ReadWrite.All` if you want write-capable file tools)
+   - `User.Read`
+   - `offline_access` (required for refresh tokens)
+   - `MailboxSettings.ReadWrite`
+8. **Certificates & secrets** → New client secret → record the value (in 1Password). This is your `MICROSOFT_CLIENT_SECRET`. You can only see it once — copy immediately.
+
+### 4. Update wrangler.jsonc
+
+Edit `wrangler.jsonc` and replace both:
+- `vars.MICROSOFT_CLIENT_ID` — with the Application ID from Step 3.6
+- `vars.MICROSOFT_TENANT_ID` — with the Directory ID from Step 3.6 (or `common`)
+
+### 5. Set secrets
+
+Generate a fresh approval code:
+
 ```bash
-cd "/Users/basheerco/Documents/AI Agents & Workflows/Outlook-MCP/outlook-mcp"
-wrangler secret put MICROSOFT_CLIENT_SECRET
-```
-4. Paste the new value when prompted — no redeploy needed
-
----
-
-## How to add a new tool
-
-All tools live in `src/tools.ts`. Adding one takes three steps:
-
-**1. Add the schema** — in the `TOOLS` array, add a new object:
-```typescript
-{
-  name: 'your_tool_name',
-  description: 'What this tool does — Claude reads this to decide when to use it.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      param_name: { type: 'string', description: 'What this parameter is for' },
-    },
-    required: ['param_name'],
-  },
-},
+openssl rand -base64 32
 ```
 
-**2. Add the handler** — add a `case` to the `callTool` switch and write the function:
-```typescript
-case 'your_tool_name': return yourToolHandler(token, args);
-```
+Store it in a password manager, then push to Cloudflare:
 
-```typescript
-async function yourToolHandler(token: string, args: ToolArgs): Promise<string> {
-  const data = await graphRequest(token, '/me/some/graph/endpoint');
-  return JSON.stringify(data);
-}
-```
-
-**3. Deploy:**
 ```bash
-wrangler deploy
+wrangler secret put MCP_APPROVAL_CODE          # paste the value from above
+wrangler secret put MICROSOFT_CLIENT_SECRET    # from Step 3.8
 ```
 
-The tool appears in Claude Desktop immediately after deploy — no restart required.
-
-### Finding Graph API endpoints
-Every tool calls the Microsoft Graph API. The full API reference is at:
-https://learn.microsoft.com/en-us/graph/api/overview
-
-Use **Graph Explorer** to test queries interactively before writing code:
-https://developer.microsoft.com/en-us/graph/graph-explorer
-
----
-
-## Key decisions and why
-
-| Decision | Reason |
+| Secret                     | Purpose |
 |---|---|
-| Cloudflare Workers | Serverless, global, generous free tier, deploys in seconds |
-| Cloudflare KV | Stateless Workers need somewhere to persist tokens between requests |
-| OAuth 2.0 authorisation code flow | Required for delegated (act-on-behalf-of-user) Graph API access |
-| Token auto-refresh | Access tokens expire after ~1 hour — refresh happens silently so tools never fail mid-use |
-| Response sanitisation | Graph API returns verbose HTML-heavy responses — stripping them keeps Claude's context lean and responses fast |
-| Local proxy (`proxy.mjs`) | Claude Desktop only supports stdio-based MCP servers — the proxy bridges stdio to the remote Worker over HTTPS |
-| TypeScript | Type safety catches mistakes at build time, not at runtime when a tool call fails |
+| `MCP_APPROVAL_CODE`        | One-time code you paste at `/authorize` to mint a Claude bearer. Also used as the encryption secret for upstream Microsoft tokens at rest — rotating it invalidates stored tokens and forces clean Microsoft re-auth. |
+| `MICROSOFT_CLIENT_SECRET`  | Your Azure AD app's client secret. |
 
----
+### 6. First deploy (to learn worker URL)
 
-## Tags
-`#tools` `#mcp` `#outlook` `#email` `#calendar` `#cloudflare` `#microsoft-graph` `#typescript`
+```bash
+npm run deploy
+```
+
+Wrangler prints your worker URL — something like `https://outlook-mcp.<your-account>.workers.dev`. Save it.
+
+### 7. Update `WORKER_URL` and the Microsoft redirect URI
+
+Two updates needed:
+
+**a) Edit `wrangler.jsonc`** — under `vars`, replace `WORKER_URL` with the URL from Step 6.
+
+**b) In the Azure AD app** (entra.microsoft.com → your app → Authentication → Add a platform → Web), set the redirect URI to `<your-worker-url>/oauth/callback`. Without this, Microsoft will reject the OAuth flow.
+
+Then redeploy:
+
+```bash
+npm run deploy
+```
+
+### 8. Connect Microsoft (one time)
+
+In your browser, visit `<your-worker-url>/oauth/start`. Paste your `MCP_APPROVAL_CODE`. You'll be redirected to Microsoft to sign in and grant the scopes from Step 3.7. After consenting, your encrypted upstream tokens land in `OAUTH_KV`. Refresh happens automatically thereafter.
+
+You can confirm the connection by visiting `<your-worker-url>/oauth/status` — should say `connected: true`.
+
+### 9. Connect Claude.ai
+
+1. In Claude.ai, go to **Settings → Integrations → Add MCP server**
+2. Server URL: `<your-worker-url>/mcp`
+3. Claude.ai redirects you to your worker's `/authorize` page
+4. Paste your `MCP_APPROVAL_CODE` and confirm
+5. You're connected — Claude now has the 28 Outlook tools available
+
+## Local development
+
+```bash
+cp .dev.vars.example .dev.vars   # fill in MCP_APPROVAL_CODE + MICROSOFT_CLIENT_SECRET; .dev.vars is gitignored
+npm test                          # 48 tests via vitest with workers pool
+npm run typecheck                 # tsc --noEmit
+npm run dev                       # wrangler dev — local at http://localhost:8787
+```
+
+## Endpoints
+
+- `GET /.well-known/oauth-authorization-server` — OAuth metadata (public)
+- `GET /.well-known/oauth-protected-resource` — Resource metadata (public)
+- `GET /authorize` — Approval-code paste page (public)
+- `POST /approve` — Approval-code submission (rate-limited)
+- `POST /token` — OAuth token exchange (rate-limited)
+- `POST /register` — Dynamic client registration per RFC 7591 (rate-limited)
+- `GET /oauth/start` — Begin Microsoft OAuth flow (gated by MCP_APPROVAL_CODE)
+- `GET /oauth/callback` — Microsoft OAuth redirect target
+- `GET /oauth/status` — Check connection state (gated by MCP_APPROVAL_CODE)
+- `POST /mcp` — JSON-RPC tool dispatch (bearer-protected, rate-limited)
+
+## Stack
+
+- Cloudflare Workers (compatibility_date `2025-04-28`, `nodejs_compat`)
+- TypeScript (strict)
+- [Hono](https://hono.dev) v4
+- [Zod](https://zod.dev) v4
+- Vitest with `@cloudflare/vitest-pool-workers` (48 tests)
+- [`@bashco/mcp-toolkit`](https://github.com/doublebash/mcp-toolkit) — shared OAuth/crypto/rate-limit/dispatch plumbing
+
+## Security architecture highlights
+
+- **Two-pass HTML sanitiser** with entity normalisation on outbound email previews
+- **SSRF guard** with 32-bit-IP normalisation on outbound HTTP
+- **Microsoft Graph odata error envelope parsing** for structured error returns
+- **Per-domain tool files** under `src/tools/` (mail, calendar, contacts, tasks, files, settings) for auditability
+
+## Continuous deployment
+
+`.github/workflows/deploy.yml` runs `vitest run` on every push to `main`, then deploys to Cloudflare. To enable on your fork, set two repository secrets:
+
+- `CLOUDFLARE_API_TOKEN` — create at [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) (use the "Edit Cloudflare Workers" template)
+- `CLOUDFLARE_ACCOUNT_ID` — find at the bottom-right of your Cloudflare dashboard
+
+## Contributing
+
+Issues and PRs welcome at [github.com/doublebash/outlook-mcp](https://github.com/doublebash/outlook-mcp).
+
+For changes to the underlying OAuth/crypto/rate-limit code, the toolkit lives at [github.com/doublebash/mcp-toolkit](https://github.com/doublebash/mcp-toolkit) — file issues there.
+
+## Security
+
+Found a vulnerability? Please **don't** open a public issue. Open a [private security advisory](https://github.com/doublebash/outlook-mcp/security/advisories/new) on GitHub.
+
+## License
+
+[MIT](./LICENSE) — Copyright (c) 2026 Bashar Basheer.

@@ -1,6 +1,20 @@
 {
 	"name": "outlook-mcp",
 	"version": "2.0.0",
+	"description": "Cloudflare Workers Model Context Protocol server bridging Claude to Microsoft Outlook — email, calendar, contacts, tasks, files. 28 tools across 6 domains. Proxied Microsoft Graph OAuth 2.0. Built on @bashco/mcp-toolkit.",
+	"keywords": [
+		"mcp",
+		"model-context-protocol",
+		"claude",
+		"anthropic",
+		"outlook",
+		"microsoft-365",
+		"microsoft-graph",
+		"email",
+		"calendar",
+		"cloudflare-workers",
+		"oauth"
+	],
 	"private": true,
 	"type": "module",
 	"scripts": {
@@ -10,7 +24,8 @@
 		"test": "vitest run",
 		"test:watch": "vitest",
 		"typecheck": "tsc --noEmit",
-		"cf-typegen": "wrangler types"
+		"cf-typegen": "wrangler types",
+		"postinstall": "wrangler types"
 	},
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "^0.12.4",
@@ -21,8 +36,18 @@
 		"wrangler": "^4.85.0"
 	},
 	"dependencies": {
-		"@bashco/mcp-toolkit": "file:../../../../ruflo-test/audits/mcp-toolkit",
+		"@bashco/mcp-toolkit": "^1.0.0",
 		"hono": "^4.12.15",
 		"zod": "^4.3.6"
+	},
+	"author": "Bashar Basheer",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/doublebash/outlook-mcp.git"
+	},
+	"homepage": "https://github.com/doublebash/outlook-mcp#readme",
+	"bugs": {
+		"url": "https://github.com/doublebash/outlook-mcp/issues"
 	}
 }

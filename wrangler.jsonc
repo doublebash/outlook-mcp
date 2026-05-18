@@ -1,3 +1,19 @@
+// Forkers: four values below must be changed to your own before deploying.
+//   1. kv_namespaces[0].id              — `wrangler kv:namespace create OAUTH_KV`
+//   2. vars.MICROSOFT_CLIENT_ID         — Application (client) ID from your Azure AD app registration
+//   3. vars.MICROSOFT_TENANT_ID         — Directory (tenant) ID from your Azure AD; use "common" if you
+//                                          want to support sign-in from any Microsoft account / personal +
+//                                          work / school tenants. The committed value is a specific tenant.
+//   4. vars.WORKER_URL                  — your deployed worker URL (run `wrangler deploy` once to find out,
+//                                          then update and redeploy). Used in OAuth metadata + redirect
+//                                          URI enforcement.
+//
+// The unsafe.bindings[].namespace_id values (3xxx range) can stay as-is unless you operate
+// multiple workers and need separate rate-limiter namespaces.
+//
+// The committed values point at the upstream maintainer's resources — useless to anyone else
+// (Cloudflare scopes KV by API token; Microsoft client IDs are public identifiers but bound to
+// a specific Azure AD app the maintainer controls), but you still need your own to deploy.
 {
 	"name": "outlook-mcp",
 	"main": "src/index.ts",
