@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
 import {
 	createBearerMiddleware,
 	createCors,
@@ -37,6 +38,8 @@ const PUBLIC_PATHS = new Set<string>([
 	"/oauth/start",
 	"/oauth/callback",
 ]);
+
+type AppContext = Context<{ Bindings: Env }>;
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -131,7 +134,7 @@ app.post("/oauth/start", oauthStartRateLimit, async (c) => {
 	});
 });
 
-app.get("/oauth/callback", async (c) => {
+app.get("/oauth/callback", async (c: AppContext) => {
 	const url = new URL(c.req.url);
 	const code = url.searchParams.get("code");
 	const returnedState = url.searchParams.get("state");
@@ -204,7 +207,7 @@ app.get("/oauth/callback", async (c) => {
 	);
 });
 
-app.get("/oauth/status", async (c) => {
+app.get("/oauth/status", async (c: AppContext) => {
 	// Bearer middleware has already validated the per-client token.
 	const tokens = await getTokens(c.env);
 	if (!tokens) {
@@ -227,7 +230,7 @@ app.get("/oauth/status", async (c) => {
 
 // Optional: revoke endpoint for explicit upstream-token clearing.
 // Bearer-gated so anyone holding a valid Claude.ai connection can clear.
-app.post("/oauth/disconnect", async (c) => {
+app.post("/oauth/disconnect", async (c: AppContext) => {
 	await clearTokens(c.env);
 	return c.json({
 		success: true,
