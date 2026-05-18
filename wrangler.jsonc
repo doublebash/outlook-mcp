@@ -3,22 +3,22 @@
 	"main": "src/index.ts",
 	"compatibility_date": "2025-04-28",
 	"compatibility_flags": ["nodejs_compat"],
-	"observability": {
-		"enabled": true
-	},
+	"observability": { "enabled": true },
 	"kv_namespaces": [
-		{
-			"binding": "OAUTH_KV",
-			"id": "4994370056d545869e91491b115753fc"
-		},
-		{
-			"binding": "OUTLOOK_OAUTH_KV",
-			"id": "8bdfb8af9e284f2aa38aa03f66c9f650"
-		}
+		{ "binding": "OAUTH_KV", "id": "4994370056d545869e91491b115753fc" }
 	],
 	"vars": {
 		"MICROSOFT_CLIENT_ID": "d36110b9-d68d-4e3c-b611-e31aaae38f94",
 		"MICROSOFT_TENANT_ID": "5fa1667c-fd27-4b4d-8a8a-bf5e9e38c626",
 		"WORKER_URL": "https://outlook-mcp.bashar-basheer.workers.dev"
+	},
+	"unsafe": {
+		"bindings": [
+			{ "name": "RATE_LIMIT_APPROVE",     "type": "ratelimit", "namespace_id": "3001", "simple": { "limit": 5,  "period": 60 } },
+			{ "name": "RATE_LIMIT_TOKEN",       "type": "ratelimit", "namespace_id": "3002", "simple": { "limit": 10, "period": 60 } },
+			{ "name": "RATE_LIMIT_REGISTER",    "type": "ratelimit", "namespace_id": "3003", "simple": { "limit": 10, "period": 60 } },
+			{ "name": "RATE_LIMIT_MCP",         "type": "ratelimit", "namespace_id": "3004", "simple": { "limit": 60, "period": 60 } },
+			{ "name": "RATE_LIMIT_OAUTH_START", "type": "ratelimit", "namespace_id": "3005", "simple": { "limit": 5,  "period": 60 } }
+		]
 	}
 }
