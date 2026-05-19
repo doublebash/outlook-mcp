@@ -5,6 +5,7 @@ import { contactsTools } from "./contacts.js";
 import { emailTools } from "./email.js";
 import { filesTools } from "./files.js";
 import { mailboxTools } from "./mailbox.js";
+import { meetingsTools } from "./meetings.js";
 import { tasksTools } from "./tasks.js";
 
 const ALL_TOOL_BUNDLES = [
@@ -14,6 +15,7 @@ const ALL_TOOL_BUNDLES = [
 	tasksTools,
 	mailboxTools,
 	filesTools,
+	meetingsTools,
 ] as const;
 
 // Concatenate every per-domain bundle's tool definitions into one array.

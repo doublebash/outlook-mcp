@@ -5,12 +5,34 @@ import { buildMessageBody } from "../email-helpers.js";
 import { graphDelete, graphGet, graphPatch, graphPost } from "../graph.js";
 import { sanitizeEventList } from "../sanitize.js";
 import type { Env } from "../types.js";
-import { BODY_TYPE_DESC, auditLog, recurrenceSchema } from "./_shared.js";
+import {
+	BODY_TYPE_DESC,
+	auditLog,
+	escapeOdataString,
+	recurrenceSchema,
+} from "./_shared.js";
 
 // Common $select for events — kept here so list and instances stay in sync.
 // Note: `recurrence` is included so sanitizeEventList can flag `isRecurring`.
 const EVENT_SELECT =
 	"id,seriesMasterId,type,subject,start,end,location,attendees,organizer,bodyPreview,isOnlineMeeting,onlineMeetingUrl,categories,recurrence,isCancelled,responseStatus";
+
+// Microsoft Graph's OData $filter interprets a date-only string like
+// "2026-05-19" as midnight UTC at the START of that day — so an end_date of
+// "2026-05-19" silently EXCLUDES every event on May 19. v2.2.3 fixes this by
+// expanding date-only inputs to inclusive day boundaries before they reach
+// the filter. Strings that already carry a time component pass through.
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
+export function normaliseStartDate(input: string): string {
+	if (DATE_ONLY.test(input)) return `${input}T00:00:00.000Z`;
+	return input;
+}
+
+export function normaliseEndDate(input: string): string {
+	if (DATE_ONLY.test(input)) return `${input}T23:59:59.999Z`;
+	return input;
+}
 
 const eventIdSchema = z.string().min(1).max(512);
 
@@ -18,18 +40,41 @@ const eventIdSchema = z.string().min(1).max(512);
 
 async function listCalendarEventsImpl(
 	env: Env,
-	args: { start_date?: string; end_date?: string; count?: number },
+	args: {
+		start_date?: string;
+		end_date?: string;
+		count?: number;
+		subject_contains?: string;
+	},
 ): Promise<unknown> {
 	const now = new Date();
+	// Default window: 7 days past → 7 days future. Symmetric around "now" so
+	// both "what just happened?" and "what's coming up?" queries hit. The old
+	// default was now → now+7d (future only), which silently dropped past
+	// events — a Claude asking for "the most recent meeting" would never see
+	// anything that had already ended. v2.2.2 fixed this.
+	const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 	const weekLater = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-	const start = args.start_date ?? now.toISOString();
-	const end = args.end_date ?? weekLater.toISOString();
-	const count = args.count ?? 20;
+	const start = args.start_date
+		? normaliseStartDate(args.start_date)
+		: weekAgo.toISOString();
+	const end = args.end_date
+		? normaliseEndDate(args.end_date)
+		: weekLater.toISOString();
+	// Default raised from 20 → 100 in v2.2.0. The old default silently truncated
+	// wide-range queries; Claude has no way to know it missed events on later
+	// pages. 100 covers ~95% of practical "search across the last month" cases.
+	const count = args.count ?? 100;
+
+	const dateFilter = `start/dateTime ge '${start}' and start/dateTime le '${end}'`;
+	const subjectFilter = args.subject_contains
+		? ` and contains(subject,'${escapeOdataString(args.subject_contains)}')`
+		: "";
 
 	const data = (await graphGet(env, "/me/events", {
 		$select: EVENT_SELECT,
 		$top: count,
-		$filter: `start/dateTime ge '${start}' and start/dateTime le '${end}'`,
+		$filter: `${dateFilter}${subjectFilter}`,
 		$orderby: "start/dateTime",
 	})) as { value: unknown[] };
 	return sanitizeEventList(data.value);
@@ -193,8 +238,8 @@ async function listEventOccurrencesImpl(
 ): Promise<unknown> {
 	const count = args.count ?? 50;
 	const data = (await graphGet(env, `/me/events/${args.series_id}/instances`, {
-		startDateTime: args.start_date,
-		endDateTime: args.end_date,
+		startDateTime: normaliseStartDate(args.start_date),
+		endDateTime: normaliseEndDate(args.end_date),
 		$select: EVENT_SELECT,
 		$top: count,
 		$orderby: "start/dateTime",
@@ -211,11 +256,13 @@ async function listEventOccurrencesImpl(
 
 export const calendarTools = defineTools<Env>({
 	list_calendar_events: {
-		description: "Retrieve calendar events within a date range.",
+		description:
+			"Retrieve calendar events within a date range. Default window when no dates are supplied is **7 days past → 7 days future** (symmetric around now) — so 'most recent meeting' and 'next meeting' queries both work without prompting. Default count is 100 (max 200). Use `subject_contains` to filter server-side by substring match on the event subject (case-insensitive) — much more efficient than fetching everything and grepping client-side.",
 		schema: z.object({
 			start_date: z.string().min(1).max(64).optional(),
 			end_date: z.string().min(1).max(64).optional(),
 			count: z.number().int().min(1).max(200).optional(),
+			subject_contains: z.string().min(1).max(256).optional(),
 		}),
 		handler: (env, args) => listCalendarEventsImpl(env, args),
 	},

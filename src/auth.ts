@@ -6,6 +6,8 @@ const ENCRYPTION_NAMESPACE = "outlook-mcp-v2";
 
 // Every Microsoft Graph delegated permission we ask for.
 // `offline_access` is required for refresh tokens.
+// `OnlineMeetingRecording.Read.All` and `OnlineMeetingTranscript.Read.All`
+// require admin consent in Azure AD even on single-tenant setups.
 export const SCOPES = [
 	"Mail.ReadWrite",
 	"Mail.Send",
@@ -15,6 +17,9 @@ export const SCOPES = [
 	"MailboxSettings.ReadWrite",
 	"Tasks.ReadWrite",
 	"Sites.Read.All",
+	"OnlineMeetings.Read",
+	"OnlineMeetingRecording.Read.All",
+	"OnlineMeetingTranscript.Read.All",
 	"offline_access",
 	"User.Read",
 ].join(" ");

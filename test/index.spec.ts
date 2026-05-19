@@ -8,6 +8,12 @@ import {
 	validateAndBuildAttachments,
 } from "../src/email-helpers.js";
 import { buildRecurrence } from "../src/calendar-helpers.js";
+import { parseVtt } from "../src/transcript-helpers.js";
+import { extractJoinUrlFromBody } from "../src/tools/meetings.js";
+import {
+	normaliseStartDate,
+	normaliseEndDate,
+} from "../src/tools/calendar.js";
 
 // ── HTML → plain text (inbound display) ───────────────────────────────────────
 
@@ -377,5 +383,212 @@ describe("router", () => {
 	it("returns 401 (not 404) for unknown paths — bearer middleware runs first", async () => {
 		const response = await SELF.fetch("https://example.com/does-not-exist");
 		expect(response.status).toBe(401);
+	});
+});
+
+// ── VTT transcript parser ─────────────────────────────────────────────────────
+// Microsoft Graph returns text/vtt only; we parse to structured JSON locally.
+
+describe("parseVtt (Teams transcript parser)", () => {
+	it("parses a single cue with a voice tag", () => {
+		const vtt = `WEBVTT
+
+00:00:00.030 --> 00:00:02.140
+<v Frank Wiess>Hey, Pavel. Hey, Mary.</v>
+`;
+		const { count, cues } = parseVtt(vtt);
+		expect(count).toBe(1);
+		expect(cues[0]).toEqual({
+			start: 0.03,
+			end: 2.14,
+			speaker: "Frank Wiess",
+			text: "Hey, Pavel. Hey, Mary.",
+		});
+	});
+
+	it("parses multiple cues in order", () => {
+		const vtt = `WEBVTT
+
+00:00:00.000 --> 00:00:02.000
+<v Alice>First line.</v>
+
+00:00:02.000 --> 00:00:04.500
+<v Bob>Second line.</v>
+`;
+		const { count, cues } = parseVtt(vtt);
+		expect(count).toBe(2);
+		expect(cues[0]?.speaker).toBe("Alice");
+		expect(cues[1]?.speaker).toBe("Bob");
+		expect(cues[1]?.end).toBe(4.5);
+	});
+
+	it("skips WEBVTT header, NOTE blocks, and cue identifiers", () => {
+		const vtt = `WEBVTT - Meeting transcript
+
+NOTE
+This is a note block and should be ignored.
+
+73f9b81b-0099-4322-bb31-ec4a3a6e23b6/1-0
+00:00:01.000 --> 00:00:02.000
+<v Alice>Hello.</v>
+`;
+		const { count, cues } = parseVtt(vtt);
+		expect(count).toBe(1);
+		expect(cues[0]?.text).toBe("Hello.");
+		expect(cues[0]?.speaker).toBe("Alice");
+	});
+
+	it("strips inline tags (italic, color, timestamp markers) but keeps text", () => {
+		const vtt = `WEBVTT
+
+00:00:00.000 --> 00:00:05.000
+<v Alice><i>emphasised</i> and <c.yellow>coloured</c> with <00:00:02.500>marker.</v>
+`;
+		const { cues } = parseVtt(vtt);
+		expect(cues[0]?.text).toBe("emphasised and coloured with marker.");
+		expect(cues[0]?.speaker).toBe("Alice");
+	});
+
+	it("handles voice tags with class names (extracts speaker, ignores classes)", () => {
+		const vtt = `WEBVTT
+
+00:00:00.000 --> 00:00:01.000
+<v.first.loud Esme>Loud opener.</v>
+`;
+		const { cues } = parseVtt(vtt);
+		expect(cues[0]?.speaker).toBe("Esme");
+		expect(cues[0]?.text).toBe("Loud opener.");
+	});
+
+	it("handles negative offsets (transcription started mid-call)", () => {
+		const vtt = `WEBVTT
+
+-00:00:30.000 --> 00:00:00.000
+<v Alice>Already mid-sentence...</v>
+`;
+		const { cues } = parseVtt(vtt);
+		expect(cues[0]?.start).toBe(-30);
+		expect(cues[0]?.end).toBe(0);
+	});
+
+	it("preserves text without a voice tag (speaker = null)", () => {
+		const vtt = `WEBVTT
+
+00:00:00.000 --> 00:00:01.000
+No speaker attribution here.
+`;
+		const { cues } = parseVtt(vtt);
+		expect(cues[0]?.speaker).toBeNull();
+		expect(cues[0]?.text).toBe("No speaker attribution here.");
+	});
+
+	it("returns empty cues for empty or header-only input", () => {
+		expect(parseVtt("").count).toBe(0);
+		expect(parseVtt("WEBVTT\n").count).toBe(0);
+		expect(parseVtt("WEBVTT\n\nNOTE\nJust a note.\n").count).toBe(0);
+	});
+
+	it("skips malformed cues but keeps well-formed ones around them", () => {
+		const vtt = `WEBVTT
+
+99:99:99.bad --> 00:00:01.000
+This cue has a bad timing line.
+
+00:00:02.000 --> 00:00:03.000
+<v Alice>This cue is fine.</v>
+`;
+		const { count, cues } = parseVtt(vtt);
+		expect(count).toBe(1);
+		expect(cues[0]?.speaker).toBe("Alice");
+	});
+});
+
+// ── Join URL extractor (body-preview fallback for events lacking structured fields) ───
+
+describe("extractJoinUrlFromBody (Outlook add-in fallback)", () => {
+	it("extracts the new short-URL Teams format from a real Outlook body preview", () => {
+		const body =
+			"________________________________________________________________________________\r\n" +
+			"Microsoft Teams meeting\r\n" +
+			"Join: https://teams.microsoft.com/meet/42948338826416?p=U3RjMQ8vO4KbJIH0po\r\n" +
+			"Meeting ID: 429 483 388 264 16\r\n" +
+			"Passcode: Wq2mY2VF\r\n" +
+			"__________________";
+		expect(extractJoinUrlFromBody(body)).toBe(
+			"https://teams.microsoft.com/meet/42948338826416?p=U3RjMQ8vO4KbJIH0po",
+		);
+	});
+
+	it("extracts the legacy meetup-join URL with context query string", () => {
+		const body =
+			"Click here to join the meeting: https://teams.microsoft.com/l/meetup-join/19%3Ameeting_abc%40thread.v2/0?context=%7B%22Tid%22%3A%22xyz%22%7D extra trailing text";
+		expect(extractJoinUrlFromBody(body)).toBe(
+			"https://teams.microsoft.com/l/meetup-join/19%3Ameeting_abc%40thread.v2/0?context=%7B%22Tid%22%3A%22xyz%22%7D",
+		);
+	});
+
+	it("extracts the personal-account teams.live.com variant", () => {
+		const body = "Join: https://teams.live.com/meet/9876543210?p=ABCdef";
+		expect(extractJoinUrlFromBody(body)).toBe(
+			"https://teams.live.com/meet/9876543210?p=ABCdef",
+		);
+	});
+
+	it("returns null when no Teams meeting URL is present", () => {
+		expect(extractJoinUrlFromBody("Some unrelated body text")).toBeNull();
+		expect(
+			extractJoinUrlFromBody(
+				"https://teams.microsoft.com/meetingOptions/?organizerId=xyz",
+			),
+		).toBeNull();
+		expect(extractJoinUrlFromBody("")).toBeNull();
+		expect(extractJoinUrlFromBody(undefined)).toBeNull();
+	});
+
+	it("returns the first matching URL when multiple are present", () => {
+		const body =
+			"Quick link: https://teams.microsoft.com/meet/111?p=AAA " +
+			"Backup: https://teams.microsoft.com/l/meetup-join/19%3Ameeting_xxx%40thread.v2/0?context=%7B%7D";
+		expect(extractJoinUrlFromBody(body)).toBe(
+			"https://teams.microsoft.com/meet/111?p=AAA",
+		);
+	});
+});
+
+// ── Date-only input normalisation (Microsoft OData filter inclusivity) ────────
+
+describe("normaliseStartDate / normaliseEndDate", () => {
+	it("expands a date-only start to start-of-day UTC", () => {
+		expect(normaliseStartDate("2026-05-19")).toBe(
+			"2026-05-19T00:00:00.000Z",
+		);
+	});
+
+	it("expands a date-only end to end-of-day UTC (NOT next-day midnight)", () => {
+		expect(normaliseEndDate("2026-05-19")).toBe(
+			"2026-05-19T23:59:59.999Z",
+		);
+	});
+
+	it("leaves full ISO datetime strings untouched", () => {
+		const isoStart = "2026-05-19T02:00:00Z";
+		const isoEnd = "2026-05-19T23:59:59.999Z";
+		expect(normaliseStartDate(isoStart)).toBe(isoStart);
+		expect(normaliseEndDate(isoEnd)).toBe(isoEnd);
+	});
+
+	it("leaves datetime strings with timezone offset untouched", () => {
+		const offset = "2026-05-19T14:00:00+12:00";
+		expect(normaliseStartDate(offset)).toBe(offset);
+		expect(normaliseEndDate(offset)).toBe(offset);
+	});
+
+	it("doesn't false-positive on malformed strings (passes through)", () => {
+		// Anything that isn't strictly YYYY-MM-DD passes through unchanged so
+		// Graph itself returns a clear validation error rather than us silently
+		// reshaping bad input.
+		expect(normaliseStartDate("2026/05/19")).toBe("2026/05/19");
+		expect(normaliseEndDate("yesterday")).toBe("yesterday");
+		expect(normaliseStartDate("2026-5-19")).toBe("2026-5-19");
 	});
 });

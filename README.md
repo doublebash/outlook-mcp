@@ -1,18 +1,19 @@
 # Outlook MCP Server
 
-A **Model Context Protocol** server bridging Claude to **Microsoft Outlook** (email, calendar, contacts, tasks, files), deployed on **Cloudflare Workers**.
+A **Model Context Protocol** server bridging Claude to **Microsoft Outlook + Teams** (email, calendar, contacts, tasks, files, Teams meeting recordings + transcripts), deployed on **Cloudflare Workers**.
 
 Fork this repo, deploy to your own Cloudflare account, register a Microsoft Azure AD app, point Claude.ai at your worker, and Claude can read and write your Microsoft 365 data through natural language.
 
 Built on [`@bashco/mcp-toolkit`](https://github.com/doublebash/mcp-toolkit) — OAuth, per-client bearer tokens, rate limiting, structured logging, typed tool dispatch are all handled by the shared library.
 
-## What Claude gets — 28 tools across 6 domains
+## What Claude gets — 33 tools across 7 domains
 
 - **Mail**: list emails, read email, search, reply, forward, delete, send, move between folders, create draft, update draft, send draft, schedule send
 - **Calendar**: list events, list event occurrences, create, update, delete, cancel event, respond to event
 - **Contacts**: list, create contact
 - **Tasks**: list task lists, list tasks, create task
 - **Files**: list files, share file
+- **Teams meetings**: list recent recordings (the discovery starting point — finds meetings that have content in the past N days, no inputs needed), find online meeting, list meeting recordings, list meeting transcripts, get transcript content. Each per-meeting tool accepts any of `meeting_id`, `calendar_event_id`, or `join_url` — so scheduled meetings (resolved via event), ad-hoc / Meet-now calls (resolved via join URL pasted from the Teams chat), and direct id lookups all work.
 - **Conversation**: get conversation (full thread)
 - **Settings**: get mailbox settings, set out-of-office
 
@@ -81,6 +82,12 @@ Edit `wrangler.jsonc` and replace the existing `id` under `kv_namespaces` with w
    - `User.Read`
    - `offline_access` (required for refresh tokens)
    - `MailboxSettings.ReadWrite`
+   - `Sites.Read.All`
+   - `OnlineMeetings.Read`
+   - `OnlineMeetingRecording.Read.All` — **admin consent required**
+   - `OnlineMeetingTranscript.Read.All` — **admin consent required**
+
+   After adding the two `.Read.All` permissions, click **"Grant admin consent for [tenant name]"** on the API permissions page. Without admin consent, the meeting recording / transcript tools will 403.
 8. **Certificates & secrets** → New client secret → record the value (in 1Password). This is your `MICROSOFT_CLIENT_SECRET`. You can only see it once — copy immediately.
 
 ### 4. Update wrangler.jsonc
@@ -143,7 +150,7 @@ You can confirm the connection by visiting `<your-worker-url>/oauth/status` — 
 2. Server URL: `<your-worker-url>/mcp`
 3. Claude.ai redirects you to your worker's `/authorize` page
 4. Paste your `MCP_APPROVAL_CODE` and confirm
-5. You're connected — Claude now has the 28 Outlook tools available
+5. You're connected — Claude now has the 33 Outlook + Teams tools available
 
 ## Local development
 
@@ -181,7 +188,7 @@ npm run dev                       # wrangler dev — local at http://localhost:8
 - **Two-pass HTML sanitiser** with entity normalisation on outbound email previews
 - **SSRF guard** with 32-bit-IP normalisation on outbound HTTP
 - **Microsoft Graph odata error envelope parsing** for structured error returns
-- **Per-domain tool files** under `src/tools/` (mail, calendar, contacts, tasks, files, settings) for auditability
+- **Per-domain tool files** under `src/tools/` (mail, calendar, contacts, tasks, files, meetings, settings) for auditability
 
 ## Continuous deployment
 
