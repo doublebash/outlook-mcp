@@ -143,6 +143,67 @@ async function sendEmailImpl(
 	return { success: true, message: "Email sent." };
 }
 
+type GraphRecipient = { emailAddress: { address: string } };
+
+interface GraphReplyOriginal {
+	from?: { emailAddress?: { address?: string } } | null;
+	toRecipients?: Array<{ emailAddress?: { address?: string } }> | null;
+	ccRecipients?: Array<{ emailAddress?: { address?: string } }> | null;
+}
+
+// Decide whether a reply needs its recipients overridden.
+//
+// Microsoft Graph's createReply/createReplyAll sets the draft's To: from the
+// ORIGINAL message's sender. That's correct when replying to someone else, but
+// when you reply to your OWN sent message the sender is you — so the reply
+// bounces back to yourself instead of reaching the person you originally wrote
+// to. This recomputes the recipients for that self-sent case.
+//
+// Returns null when no override is needed (the message was sent by someone
+// else — Graph's default is right). Returns recipient lists when the owner sent
+// the original, so the caller can redirect To: (and, for reply-all, CC:) to the
+// original recipients with the owner removed.
+export function computeSelfReplyRecipients(
+	original: GraphReplyOriginal,
+	ownerAddress: string,
+	replyAll: boolean,
+): { toRecipients: GraphRecipient[]; ccRecipients: GraphRecipient[] } | null {
+	const owner = ownerAddress.trim().toLowerCase();
+	const fromAddr = original.from?.emailAddress?.address?.trim().toLowerCase() ?? "";
+
+	// Only intervene when the message being replied to was sent BY the owner.
+	if (!owner || fromAddr !== owner) return null;
+
+	const dedupeExcludingOwner = (
+		list: Array<{ emailAddress?: { address?: string } }> | null | undefined,
+	): GraphRecipient[] => {
+		const seen = new Set<string>();
+		const out: GraphRecipient[] = [];
+		for (const r of list ?? []) {
+			const addr = r.emailAddress?.address?.trim();
+			if (!addr) continue;
+			const key = addr.toLowerCase();
+			if (key === owner || seen.has(key)) continue;
+			seen.add(key);
+			out.push({ emailAddress: { address: addr } });
+		}
+		return out;
+	};
+
+	return {
+		toRecipients: dedupeExcludingOwner(original.toRecipients),
+		ccRecipients: replyAll ? dedupeExcludingOwner(original.ccRecipients) : [],
+	};
+}
+
+// The mailbox owner's primary SMTP address, used to detect replies to self.
+async function getMailboxOwnerAddress(env: Env): Promise<string | null> {
+	const me = (await graphGet(env, "/me", {
+		$select: "mail,userPrincipalName",
+	})) as { mail?: string | null; userPrincipalName?: string | null };
+	return me.mail ?? me.userPrincipalName ?? null;
+}
+
 async function replyToEmailImpl(
 	env: Env,
 	args: {
@@ -154,12 +215,42 @@ async function replyToEmailImpl(
 	},
 ): Promise<unknown> {
 	const action = args.reply_all ? "createReplyAll" : "createReply";
-	const draft = (await graphPost(env, `/me/messages/${args.id}/${action}`)) as {
-		id: string;
+
+	// Fetch the original sender/recipients and the mailbox owner alongside
+	// creating the reply draft, so we can fix the reply-to-self bounce below.
+	const [original, owner, draft] = await Promise.all([
+		graphGet(env, `/me/messages/${args.id}`, {
+			$select: "from,toRecipients,ccRecipients",
+		}) as Promise<GraphReplyOriginal>,
+		getMailboxOwnerAddress(env),
+		graphPost(env, `/me/messages/${args.id}/${action}`) as Promise<{ id: string }>,
+	]);
+
+	const updates: Record<string, unknown> = {
+		body: buildMessageBody(args.body, args.body_type),
 	};
 
-	const body = buildMessageBody(args.body, args.body_type);
-	await graphPatch(env, `/me/messages/${draft.id}`, { body });
+	const override = owner
+		? computeSelfReplyRecipients(original, owner, !!args.reply_all)
+		: null;
+	if (override) {
+		if (override.toRecipients.length === 0) {
+			// Replying to your own message that had no other recipient. Refuse
+			// rather than silently emailing yourself; clean up the orphan draft.
+			try {
+				await graphDelete(env, `/me/messages/${draft.id}`);
+			} catch {
+				/* leave the orphan draft if cleanup fails */
+			}
+			throw ToolError.validation(
+				"This message was sent by you and has no other recipient to reply to. Use send_email to start a new message instead.",
+			);
+		}
+		updates.toRecipients = override.toRecipients;
+		updates.ccRecipients = override.ccRecipients;
+	}
+
+	await graphPatch(env, `/me/messages/${draft.id}`, updates);
 
 	if (args.attachments && args.attachments.length > 0) {
 		await uploadAttachmentsToDraft(env, draft.id, args.attachments);
@@ -169,6 +260,7 @@ async function replyToEmailImpl(
 	auditLog("reply_sent", {
 		in_reply_to: args.id,
 		reply_all: !!args.reply_all,
+		self_reply_redirected: !!override,
 		attachments: args.attachments?.length ?? 0,
 		attachment_sources: summariseAttachmentSources(args.attachments),
 	});

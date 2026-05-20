@@ -14,6 +14,7 @@ import {
 	normaliseStartDate,
 	normaliseEndDate,
 } from "../src/tools/calendar.js";
+import { computeSelfReplyRecipients } from "../src/tools/email.js";
 
 // ── HTML → plain text (inbound display) ───────────────────────────────────────
 
@@ -590,5 +591,81 @@ describe("normaliseStartDate / normaliseEndDate", () => {
 		expect(normaliseStartDate("2026/05/19")).toBe("2026/05/19");
 		expect(normaliseEndDate("yesterday")).toBe("yesterday");
 		expect(normaliseStartDate("2026-5-19")).toBe("2026-5-19");
+	});
+});
+
+// ── Reply-to-self recipient redirect ───────────────────────────────────────────
+
+describe("computeSelfReplyRecipients", () => {
+	const owner = "me@bashco.co.nz";
+
+	const msg = (
+		from: string,
+		to: string[],
+		cc: string[] = [],
+	) => ({
+		from: { emailAddress: { address: from } },
+		toRecipients: to.map((a) => ({ emailAddress: { address: a } })),
+		ccRecipients: cc.map((a) => ({ emailAddress: { address: a } })),
+	});
+
+	it("returns null when replying to someone else's message (Graph default is correct)", () => {
+		const original = msg("adam@example.com", [owner]);
+		expect(computeSelfReplyRecipients(original, owner, false)).toBeNull();
+	});
+
+	it("matches the sender case-insensitively before deciding it's a self-reply", () => {
+		const original = msg("ME@BashCo.co.NZ", ["client@example.com"]);
+		const result = computeSelfReplyRecipients(original, owner, false);
+		expect(result).not.toBeNull();
+		expect(result?.toRecipients).toEqual([
+			{ emailAddress: { address: "client@example.com" } },
+		]);
+	});
+
+	it("redirects a self-sent reply to the original recipients", () => {
+		const original = msg(owner, ["client@example.com"]);
+		const result = computeSelfReplyRecipients(original, owner, false);
+		expect(result?.toRecipients).toEqual([
+			{ emailAddress: { address: "client@example.com" } },
+		]);
+		// Plain reply drops CC.
+		expect(result?.ccRecipients).toEqual([]);
+	});
+
+	it("removes the owner from the recipient list so the reply never bounces to self", () => {
+		const original = msg(owner, [owner, "client@example.com"], [owner]);
+		const result = computeSelfReplyRecipients(original, owner, true);
+		expect(result?.toRecipients).toEqual([
+			{ emailAddress: { address: "client@example.com" } },
+		]);
+		expect(result?.ccRecipients).toEqual([]);
+	});
+
+	it("includes CC recipients only for reply-all", () => {
+		const original = msg(owner, ["client@example.com"], ["cc@example.com"]);
+		expect(computeSelfReplyRecipients(original, owner, false)?.ccRecipients).toEqual([]);
+		expect(computeSelfReplyRecipients(original, owner, true)?.ccRecipients).toEqual([
+			{ emailAddress: { address: "cc@example.com" } },
+		]);
+	});
+
+	it("dedupes repeated recipients", () => {
+		const original = msg(owner, [
+			"client@example.com",
+			"CLIENT@example.com",
+			"other@example.com",
+		]);
+		expect(computeSelfReplyRecipients(original, owner, false)?.toRecipients).toEqual([
+			{ emailAddress: { address: "client@example.com" } },
+			{ emailAddress: { address: "other@example.com" } },
+		]);
+	});
+
+	it("returns an empty To: list when the owner was the only recipient (caller refuses to send)", () => {
+		const original = msg(owner, [owner]);
+		const result = computeSelfReplyRecipients(original, owner, false);
+		expect(result).not.toBeNull();
+		expect(result?.toRecipients).toEqual([]);
 	});
 });
