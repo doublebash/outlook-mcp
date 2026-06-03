@@ -21,12 +21,15 @@ const SUPPORTED_PROTOCOL_VERSIONS = ["2024-11-05", "2025-03-26"] as const;
 const DEFAULT_PROTOCOL_VERSION: (typeof SUPPORTED_PROTOCOL_VERSIONS)[number] =
 	"2024-11-05";
 
-// Claude.ai's web/desktop OAuth client registers redirect URIs under these hosts.
+// OAuth client redirect URIs are allowed only under these hosts.
+//   - claude.ai / claude.com — Claude.ai's web/desktop OAuth client
+//   - 127.0.0.1 — loopback callback for native CLI clients (e.g. Hermes Agent)
 const ALLOWED_REDIRECT_HOSTS = new Set([
 	"claude.ai",
 	"api.claude.ai",
 	"claude.com",
 	"api.claude.com",
+	"127.0.0.1",
 ]);
 
 // 15 MB MCP body cap — generous enough to accept tool calls with 10 MB of
@@ -62,6 +65,8 @@ const oauth = createOAuthServer<Env>({
 	kv: (env) => env.OAUTH_KV,
 	approvalCodeSecret: (env) => env.MCP_APPROVAL_CODE,
 	allowedRedirectHosts: ALLOWED_REDIRECT_HOSTS,
+	// https for cloud clients (claude.ai); http for loopback (127.0.0.1) per RFC 8252.
+	allowedRedirectSchemes: new Set(["https:", "http:"]),
 	rateLimiters: {
 		approve: createRateLimit<Env>({
 			binding: (env) => env.RATE_LIMIT_APPROVE,
