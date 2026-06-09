@@ -15,6 +15,7 @@ import {
 	normaliseEndDate,
 } from "../src/tools/calendar.js";
 import { computeSelfReplyRecipients } from "../src/tools/email.js";
+import { base64ToBytes, UPLOAD_ALLOWED_MIME_TYPES } from "../src/tools/files.js";
 
 // ── HTML → plain text (inbound display) ───────────────────────────────────────
 
@@ -667,5 +668,47 @@ describe("computeSelfReplyRecipients", () => {
 		const result = computeSelfReplyRecipients(original, owner, false);
 		expect(result).not.toBeNull();
 		expect(result?.toRecipients).toEqual([]);
+	});
+});
+
+// ── OneDrive upload helpers ───────────────────────────────────────────────────
+
+describe("base64ToBytes", () => {
+	it("round-trips simple ASCII", () => {
+		const out = base64ToBytes(btoa("hello"));
+		expect(new TextDecoder().decode(out)).toBe("hello");
+	});
+
+	it("round-trips arbitrary binary bytes (PNG header sample)", () => {
+		const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+		const b64 = btoa(String.fromCharCode(...png));
+		const out = base64ToBytes(b64);
+		expect(Array.from(out)).toEqual(Array.from(png));
+	});
+
+	it("throws ToolError-style validation on invalid base64", () => {
+		expect(() => base64ToBytes("not!!base64$$$$")).toThrow(/base64/);
+	});
+});
+
+describe("UPLOAD_ALLOWED_MIME_TYPES", () => {
+	it("includes text/vcard (the .vcf use case that motivated this work)", () => {
+		expect(UPLOAD_ALLOWED_MIME_TYPES.has("text/vcard")).toBe(true);
+	});
+
+	it("includes the legacy text/x-vcard alias", () => {
+		expect(UPLOAD_ALLOWED_MIME_TYPES.has("text/x-vcard")).toBe(true);
+	});
+
+	it("includes text/calendar (.ics files)", () => {
+		expect(UPLOAD_ALLOWED_MIME_TYPES.has("text/calendar")).toBe(true);
+	});
+
+	it("excludes image/svg+xml (XML, scriptable)", () => {
+		expect(UPLOAD_ALLOWED_MIME_TYPES.has("image/svg+xml")).toBe(false);
+	});
+
+	it("excludes application/octet-stream (would defeat the allowlist)", () => {
+		expect(UPLOAD_ALLOWED_MIME_TYPES.has("application/octet-stream")).toBe(false);
 	});
 });

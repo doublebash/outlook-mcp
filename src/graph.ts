@@ -147,3 +147,46 @@ export async function graphRequestRaw(env: Env, path: string): Promise<Response>
 
 	return response;
 }
+
+// PUT a binary body to a Graph endpoint with an explicit Content-Type — used
+// by OneDrive simple upload (`/me/drive/root:/<path>:/content`). The toolkit
+// client serialises body as JSON, which is wrong for opaque file bytes.
+// Parses the success-case driveItem JSON so callers can return metadata.
+export async function graphPutBinary(
+	env: Env,
+	path: string,
+	body: ArrayBuffer | Uint8Array,
+	contentType: string,
+): Promise<unknown> {
+	const token = await getValidAccessToken(env);
+	const url = `${GRAPH_BASE}${path.startsWith("/") ? path : `/${path}`}`;
+	const response = await fetch(url, {
+		method: "PUT",
+		headers: {
+			Authorization: `Bearer ${token}`,
+			"Content-Type": contentType,
+		},
+		body: body as BodyInit,
+		redirect: "follow",
+	});
+
+	if (!response.ok) {
+		let errMsg = response.statusText;
+		let errCode: string | undefined;
+		try {
+			const data = (await response.clone().json()) as GraphErrorEnvelope;
+			errMsg = data.error?.message ?? errMsg;
+			errCode = data.error?.code;
+		} catch {
+			// not JSON
+		}
+		throw new ToolError({
+			userMessage: `Outlook error ${response.status}: ${errCode ?? errMsg}`,
+			internalMessage: `Graph ${response.status}: ${errCode ?? ""} ${errMsg}`,
+			status: response.status,
+			upstreamName: "Graph",
+		});
+	}
+
+	return response.json();
+}
