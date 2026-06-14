@@ -7,7 +7,7 @@ import {
 	resolveAndValidateAttachments,
 } from "../email-helpers.js";
 import { graphDelete, graphGet, graphPatch, graphPost } from "../graph.js";
-import { sanitizeEmailFull, sanitizeEmailList } from "../sanitize.js";
+import { sanitizeDraftMessage, sanitizeEmailFull, sanitizeEmailList } from "../sanitize.js";
 import type { Env } from "../types.js";
 import {
 	ATTACHMENTS_DESC,
@@ -309,6 +309,183 @@ async function forwardEmailImpl(
 	return { success: true, message: "Email forwarded." };
 }
 
+// ── Threaded draft replies/forwards ─────────────────────────────────────────────
+// Unlike reply_to_email / forward_email (which create a draft via Graph's
+// createReply/createReplyAll/createForward and immediately send it), these tools
+// leave the generated draft in Drafts so the user can review and send it later
+// from Outlook — while still preserving the original conversation thread.
+//
+// We POST to the create* endpoint with NO body, then PATCH body/recipients
+// separately. Graph rejects createReply when both a comment AND a body are
+// supplied in the same call (HTTP 400), so the two-step approach is required.
+
+const DRAFT_META_SELECT =
+	"id,subject,conversationId,webLink,toRecipients,ccRecipients,createdDateTime,lastModifiedDateTime";
+
+// Map a failed create*-draft Graph call to a clear "not found" message when the
+// original message can't be reached; otherwise pass the (already friendly)
+// Graph error through unchanged.
+function mapCreateDraftError(e: unknown, kind: "reply" | "forward"): unknown {
+	const isMissing =
+		e instanceof ToolError &&
+		(e.status === 404 ||
+			(typeof e.internalMessage === "string" &&
+				/ErrorItemNotFound|not found/i.test(e.internalMessage)));
+	if (isMissing) {
+		return ToolError.validation(
+			kind === "forward"
+				? "Could not create forward draft: message not found or not accessible."
+				: "Could not create reply draft: message not found or not accessible.",
+		);
+	}
+	return e;
+}
+
+// Apply optional updates to the freshly-created draft and return its metadata.
+// If the PATCH fails we DON'T throw — the draft already exists, so we return its
+// id plus a warning so the user never loses the generated draft. If the final
+// metadata read also fails we still return the id.
+async function finaliseThreadDraft(
+	env: Env,
+	draftId: string,
+	updates: Record<string, unknown>,
+	audit: { event: string; details: Record<string, unknown> },
+): Promise<Record<string, unknown>> {
+	let patchError: string | null = null;
+	if (Object.keys(updates).length > 0) {
+		try {
+			await graphPatch(env, `/me/messages/${draftId}`, updates);
+		} catch (e) {
+			patchError = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	auditLog(audit.event, {
+		...audit.details,
+		draft_id: draftId,
+		patch_failed: !!patchError,
+	});
+
+	let meta: Record<string, unknown>;
+	try {
+		const raw = await graphGet(env, `/me/messages/${draftId}`, {
+			$select: DRAFT_META_SELECT,
+		});
+		meta = sanitizeDraftMessage(raw) as unknown as Record<string, unknown>;
+	} catch {
+		meta = { id: draftId };
+	}
+
+	if (patchError) {
+		return {
+			success: false,
+			draft_id: draftId,
+			...meta,
+			warning:
+				"The draft reply was created in your Drafts, but updating its content failed. You can still edit and send it in Outlook, or retry with update_draft.",
+			error: patchError,
+		};
+	}
+
+	return { success: true, message: "Draft created.", draft_id: draftId, ...meta };
+}
+
+export async function createReplyDraftImpl(
+	env: Env,
+	args: { id: string; body?: string; body_type?: string; reply_all?: boolean },
+): Promise<unknown> {
+	const action = args.reply_all ? "createReplyAll" : "createReply";
+
+	let draft: { id: string };
+	try {
+		draft = (await graphPost(env, `/me/messages/${args.id}/${action}`)) as {
+			id: string;
+		};
+	} catch (e) {
+		throw mapCreateDraftError(e, "reply");
+	}
+
+	// Self-reply redirect: Graph sets the draft's To: from the ORIGINAL sender,
+	// so replying to your OWN sent message bounces back to yourself. Recompute
+	// recipients exactly as reply_to_email does.
+	const [original, owner] = await Promise.all([
+		graphGet(env, `/me/messages/${args.id}`, {
+			$select: "from,toRecipients,ccRecipients",
+		}) as Promise<GraphReplyOriginal>,
+		getMailboxOwnerAddress(env),
+	]);
+
+	const updates: Record<string, unknown> = {};
+	if (args.body !== undefined) {
+		updates.body = buildMessageBody(args.body, args.body_type);
+	}
+
+	const override = owner
+		? computeSelfReplyRecipients(original, owner, !!args.reply_all)
+		: null;
+	if (override) {
+		if (override.toRecipients.length === 0) {
+			// Replying to your own message that had no other recipient. Refuse
+			// rather than drafting a mail to yourself; clean up the orphan draft.
+			try {
+				await graphDelete(env, `/me/messages/${draft.id}`);
+			} catch {
+				/* leave the orphan draft if cleanup fails */
+			}
+			throw ToolError.validation(
+				"This message was sent by you and has no other recipient to reply to. Use create_draft to start a new message instead.",
+			);
+		}
+		updates.toRecipients = override.toRecipients;
+		updates.ccRecipients = override.ccRecipients;
+	}
+
+	return finaliseThreadDraft(env, draft.id, updates, {
+		event: "reply_draft_created",
+		details: {
+			in_reply_to: args.id,
+			reply_all: !!args.reply_all,
+			self_reply_redirected: !!override,
+		},
+	});
+}
+
+export async function createForwardDraftImpl(
+	env: Env,
+	args: {
+		id: string;
+		to?: string;
+		cc?: string;
+		bcc?: string;
+		body?: string;
+		body_type?: string;
+	},
+): Promise<unknown> {
+	let draft: { id: string };
+	try {
+		draft = (await graphPost(env, `/me/messages/${args.id}/createForward`)) as {
+			id: string;
+		};
+	} catch (e) {
+		throw mapCreateDraftError(e, "forward");
+	}
+
+	const updates: Record<string, unknown> = {};
+	if (args.to !== undefined) updates.toRecipients = buildRecipients(args.to);
+	const cc = buildRecipients(args.cc);
+	const bcc = buildRecipients(args.bcc);
+	if (cc.length) updates.ccRecipients = cc;
+	if (bcc.length) updates.bccRecipients = bcc;
+	if (args.body !== undefined) {
+		updates.body = buildMessageBody(args.body, args.body_type);
+	}
+
+	return finaliseThreadDraft(env, draft.id, updates, {
+		event: "forward_draft_created",
+		details: { forwarded_from: args.id },
+	});
+}
+
 async function deleteEmailImpl(env: Env, args: { id: string }): Promise<unknown> {
 	await graphDelete(env, `/me/messages/${args.id}`);
 	return { success: true, message: "Email deleted." };
@@ -562,6 +739,39 @@ export const emailTools = defineTools<Env>({
 			attachments: z.array(attachmentSchema).max(20).optional(),
 		}),
 		handler: (env, args) => forwardEmailImpl(env, args),
+	},
+	create_reply_draft: {
+		description:
+			"Create a saved Outlook draft reply INSIDE an existing email thread (saved to Drafts, NOT sent). Use this when the user wants to review or manually send a reply later while preserving the original conversation. Requires the original message ID. To send a reply immediately instead, use reply_to_email. The returned id can be passed to send_draft. Attachments are not supported by this tool yet — add them with update_draft on the returned draft id.",
+		schema: z.object({
+			id: emailIdSchema,
+			body: z.string().max(2 * 1024 * 1024).optional(),
+			body_type: bodyTypeSchema,
+		}),
+		handler: (env, args) => createReplyDraftImpl(env, args),
+	},
+	create_reply_all_draft: {
+		description:
+			"Create a saved Outlook draft reply-all INSIDE an existing email thread (saved to Drafts, NOT sent). Use this when the original thread has multiple recipients and the user wants to review or manually send the reply later. Graph preserves the original To/CC recipients. Requires the original message ID. To send immediately instead, use reply_to_email with reply_all. The returned id can be passed to send_draft. Attachments are not supported by this tool yet — add them with update_draft on the returned draft id.",
+		schema: z.object({
+			id: emailIdSchema,
+			body: z.string().max(2 * 1024 * 1024).optional(),
+			body_type: bodyTypeSchema,
+		}),
+		handler: (env, args) => createReplyDraftImpl(env, { ...args, reply_all: true }),
+	},
+	create_forward_draft: {
+		description:
+			"Create a saved Outlook draft forward from an existing email (saved to Drafts, NOT sent). The original message is included automatically; you can add an optional comment above it (body) and set recipients (to/cc/bcc). Use this when the user wants to review or manually send a forwarded message later. To forward and send immediately instead, use forward_email. The returned id can be passed to send_draft. Attachments are not supported by this tool yet — add them with update_draft on the returned draft id.",
+		schema: z.object({
+			id: emailIdSchema,
+			to: z.string().max(2048).optional(),
+			cc: z.string().max(2048).optional(),
+			bcc: z.string().max(2048).optional(),
+			body: z.string().max(2 * 1024 * 1024).optional(),
+			body_type: bodyTypeSchema,
+		}),
+		handler: (env, args) => createForwardDraftImpl(env, args),
 	},
 	delete_email: {
 		description: "Delete an email (moves it to the Deleted Items folder).",

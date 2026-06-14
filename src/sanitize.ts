@@ -106,6 +106,46 @@ export function sanitizeEmailFull(item: unknown): unknown {
   };
 }
 
+// ── Draft message metadata (from create_*_draft) ───────────────────────────────
+// Shapes the Graph draft returned by createReply / createReplyAll / createForward
+// (and a follow-up GET) into the verification payload the reply-draft tools
+// return. Recipients are formatted to readable "Name <addr>" strings, matching
+// read_email / get_conversation output, so callers don't get raw Graph objects.
+
+interface RawDraftMessage {
+  id?: string;
+  subject?: string;
+  conversationId?: string;
+  webLink?: string;
+  toRecipients?: Array<{ emailAddress?: { name?: string; address?: string } }>;
+  ccRecipients?: Array<{ emailAddress?: { name?: string; address?: string } }>;
+  createdDateTime?: string;
+  lastModifiedDateTime?: string;
+}
+
+export function sanitizeDraftMessage(item: unknown): {
+  id?: string;
+  subject: string;
+  conversationId?: string;
+  webLink: string | null;
+  toRecipients: string[];
+  ccRecipients: string[];
+  created?: string;
+  lastModified?: string;
+} {
+  const d = item as RawDraftMessage;
+  return {
+    id: d.id,
+    subject: d.subject ?? '(no subject)',
+    conversationId: d.conversationId,
+    webLink: d.webLink ?? null,
+    toRecipients: formatAddressList(d.toRecipients),
+    ccRecipients: formatAddressList(d.ccRecipients),
+    created: d.createdDateTime,
+    lastModified: d.lastModifiedDateTime,
+  };
+}
+
 // ── Calendar event list ────────────────────────────────────────────────────────
 
 interface RawEvent {
