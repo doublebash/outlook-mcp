@@ -95,6 +95,30 @@ async function listFilesImpl(
 	return sanitizeFileList(data.value);
 }
 
+async function getFileInfoImpl(env: Env, args: { item_path: string }): Promise<unknown> {
+	const data = (await graphGet(env, `/me/drive/root:/${encodeOneDrivePath(args.item_path)}`, {
+		$select: "id,name,size,file,folder,lastModifiedDateTime,webUrl",
+	})) as {
+		name?: string;
+		size?: number;
+		file?: { mimeType?: string };
+		folder?: unknown;
+		lastModifiedDateTime?: string;
+	};
+	if (data.folder) {
+		throw ToolError.validation(`"${args.item_path}" is a folder, not a file.`);
+	}
+	const mimeType = data.file?.mimeType ?? null;
+	return {
+		success: true,
+		name: data.name ?? null,
+		size: data.size ?? null,
+		mime_type: mimeType,
+		is_video: typeof mimeType === "string" && mimeType.startsWith("video/"),
+		last_modified: data.lastModifiedDateTime ?? null,
+	};
+}
+
 async function shareFileImpl(
 	env: Env,
 	args: {
@@ -181,6 +205,13 @@ export const filesTools = defineTools<Env>({
 			count: z.number().int().min(1).max(200).optional(),
 		}),
 		handler: (env, args) => listFilesImpl(env, args),
+	},
+
+	get_onedrive_file_info: {
+		description:
+			"Get metadata for a single OneDrive file by path (name, size in bytes, MIME type, whether it is a video, last-modified). Use this to check a file exists and inspect its type/size before downloading it — e.g. to confirm a video and decide whether it needs converting. Does NOT return the file contents.",
+		schema: z.object({ item_path: pathSchema }),
+		handler: (env, args) => getFileInfoImpl(env, args),
 	},
 
 	share_file: {

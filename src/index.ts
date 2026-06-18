@@ -8,11 +8,14 @@ import {
 	createRateLimit,
 	DEFAULT_CLAUDE_ORIGINS,
 	OAUTH_PUBLIC_PATHS,
+	ToolError,
 	escapeHtml,
 	timingSafeEqual,
 } from "@bashco/mcp-toolkit";
 import { SCOPES, clearTokens, getTokens, saveTokens } from "./auth.js";
+import { graphRequestRaw } from "./graph.js";
 import { dispatchToolCall, toolDefinitions } from "./tools/index.js";
+import { encodeOneDrivePath } from "./tools/_shared.js";
 import type { Env, OutlookTokenData } from "./types.js";
 
 const SERVER_NAME = "outlook-mcp";
@@ -241,6 +244,50 @@ app.post("/oauth/disconnect", async (c: AppContext) => {
 		success: true,
 		message: "Outlook tokens cleared. Visit /oauth/start to reconnect.",
 	});
+});
+
+// ── OneDrive raw download (operator/agent-facing) ─────────────────────────────
+// Bearer-protected by the middleware above. Streams a OneDrive item's raw bytes
+// straight through the Worker — used when bytes are too large to return inline
+// through an MCP tool call (e.g. a video being prepared for LinkedIn).
+//
+// The bytes are piped from Graph's `/content` endpoint without buffering, and
+// the pre-authenticated `@microsoft.graph.downloadUrl` that Graph redirects to
+// is followed *inside* this Worker — it is never returned to the caller. The
+// Graph access token likewise stays server-side. So no download URL, token, or
+// auth header ever leaves the Worker.
+const ONEDRIVE_PATH_RE = /^[\w \-.,()'!&+@$\/]+$/;
+
+app.get("/files/download", async (c: AppContext) => {
+	const path = c.req.query("path");
+	if (!path || path.length > 1024 || !ONEDRIVE_PATH_RE.test(path)) {
+		return c.json(
+			{ success: false, error: "Invalid or missing 'path' query parameter." },
+			400,
+		);
+	}
+
+	let upstream: Response;
+	try {
+		upstream = await graphRequestRaw(
+			c.env,
+			`/me/drive/root:/${encodeOneDrivePath(path)}:/content`,
+		);
+	} catch (e) {
+		const status = e instanceof ToolError ? (e.status ?? 502) : 502;
+		const error = e instanceof ToolError ? e.userMessage : "OneDrive download failed.";
+		return c.json({ success: false, error }, status as 400 | 401 | 404 | 500 | 502);
+	}
+
+	const name = path.split("/").filter(Boolean).pop() ?? "download";
+	const headers = new Headers();
+	headers.set("Content-Type", upstream.headers.get("Content-Type") ?? "application/octet-stream");
+	const len = upstream.headers.get("Content-Length");
+	if (len) headers.set("Content-Length", len);
+	// filename is URL-encoded so non-ASCII names can't break the header.
+	headers.set("Content-Disposition", `attachment; filename="${encodeURIComponent(name)}"`);
+	headers.set("X-File-Name", encodeURIComponent(name));
+	return new Response(upstream.body, { status: 200, headers });
 });
 
 app.route("/", oauth.routes);
