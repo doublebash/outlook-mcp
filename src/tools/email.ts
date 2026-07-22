@@ -640,7 +640,7 @@ async function moveEmailImpl(
 	return { success: true, message: "Email moved.", new_id: data.id };
 }
 
-async function createDraftImpl(
+export async function createDraftImpl(
 	env: Env,
 	args: {
 		to?: string;
@@ -650,9 +650,15 @@ async function createDraftImpl(
 		cc?: string;
 		bcc?: string;
 		attachments?: unknown[];
+		include_signature?: boolean;
 	},
 ): Promise<unknown> {
-	const draft = (await graphPost(env, "/me/messages", buildMessageObject(args))) as {
+	// Inject the signature at draft-creation time (not at send). A standalone
+	// draft is reviewed and then sent via send_draft, which never touches the
+	// body — so create time is the only point the signature can be added, and it
+	// means the user sees the signed body while reviewing.
+	const notes: string[] = [];
+	const draft = (await graphPost(env, "/me/messages", buildMessageObject(args, env, notes))) as {
 		id: string;
 		webLink?: string;
 	};
@@ -667,16 +673,20 @@ async function createDraftImpl(
 		subject: args.subject,
 		attachments: args.attachments?.length ?? 0,
 		attachment_sources: summariseAttachmentSources(args.attachments),
+		signed: !!args.include_signature,
 	});
-	return {
-		success: true,
-		message: "Draft created.",
-		draft_id: draft.id,
-		webLink: draft.webLink,
-	};
+	return withNotes(
+		{
+			success: true,
+			message: "Draft created.",
+			draft_id: draft.id,
+			webLink: draft.webLink,
+		},
+		notes,
+	);
 }
 
-async function updateDraftImpl(
+export async function updateDraftImpl(
 	env: Env,
 	args: {
 		id: string;
@@ -687,9 +697,22 @@ async function updateDraftImpl(
 		cc?: string;
 		bcc?: string;
 		attachments?: unknown[];
+		include_signature?: boolean;
 	},
 ): Promise<unknown> {
-	const updates = buildMessageObject(args);
+	const notes: string[] = [];
+
+	// Only sign when a new body is actually supplied. update_draft is a partial
+	// update ("only provide the fields you want to change"), so signing with no
+	// body would build a signature-only body and wipe whatever the draft held.
+	const signBody = args.include_signature === true && args.body !== undefined;
+	if (args.include_signature === true && args.body === undefined) {
+		notes.push(
+			"include_signature was ignored: it only applies when you also provide a new body. " +
+				"The existing draft body was left unchanged.",
+		);
+	}
+	const updates = buildMessageObject(args, signBody ? env : undefined, notes);
 	let didChange = false;
 
 	if (Object.keys(updates).length > 0) {
@@ -722,8 +745,9 @@ async function updateDraftImpl(
 		draft_id: args.id,
 		fields_updated: Object.keys(updates),
 		attachments_replaced: args.attachments !== undefined,
+		signed: signBody,
 	});
-	return { success: true, message: "Draft updated." };
+	return withNotes({ success: true, message: "Draft updated." }, notes);
 }
 
 async function sendDraftImpl(env: Env, args: { id: string }): Promise<unknown> {
@@ -951,6 +975,7 @@ export const emailTools = defineTools<Env>({
 			cc: z.string().max(2048).optional(),
 			bcc: z.string().max(2048).optional(),
 			attachments: z.array(attachmentSchema).max(20).optional(),
+			include_signature: includeSignatureSchema.describe(INCLUDE_SIGNATURE_DESC),
 		}),
 		handler: (env, args) => createDraftImpl(env, args),
 	},
@@ -966,6 +991,7 @@ export const emailTools = defineTools<Env>({
 			cc: z.string().max(2048).optional(),
 			bcc: z.string().max(2048).optional(),
 			attachments: z.array(attachmentSchema).max(20).optional(),
+			include_signature: includeSignatureSchema.describe(INCLUDE_SIGNATURE_DESC),
 		}),
 		handler: (env, args) => updateDraftImpl(env, args),
 	},

@@ -167,9 +167,16 @@ the calling agent never has to reproduce it — it can't be paraphrased,
 truncated, or forgotten.
 
 Pass `include_signature: true` to any of `send_email`, `schedule_send`,
-`reply_to_email`, `forward_email`, `create_reply_draft`,
-`create_reply_all_draft`, or `create_forward_draft`. It defaults to `false`,
-so existing callers are unaffected.
+`reply_to_email`, `forward_email`, `create_draft`, `update_draft`,
+`create_reply_draft`, `create_reply_all_draft`, or `create_forward_draft`. It
+defaults to `false`, so existing callers are unaffected.
+
+For drafts, the signature is injected at **draft-creation time**, not at send
+time — `send_draft` only takes an id and never touches the body. This means the
+signed body is what you review before sending. On `update_draft` the flag only
+applies when you also pass a new `body` (otherwise there is nothing to sign, and
+it would replace the draft with a signature-only body); that case is reported in
+the response `notes` rather than silently wiping the draft.
 
 ### Setup
 
