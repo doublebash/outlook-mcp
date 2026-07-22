@@ -129,6 +129,17 @@ const QUOTE_BOUNDARIES = [
 ];
 
 /**
+ * Breathing room between inserted content and the quoted original below it.
+ *
+ * Without this the signature butts straight up against Outlook's `<hr>` and the
+ * "From: ..." header, which reads as the signature having been cut off. It lives
+ * here rather than in SIGNATURE_HTML deliberately: a trailing break baked into
+ * the signature would also hang off the bottom of every new email, where there
+ * is no quote to separate from.
+ */
+const QUOTE_SPACER = "<br><br>";
+
+/**
  * Index at which the quoted original begins, or null when this body carries no
  * recognisable quote block.
  */
@@ -150,7 +161,7 @@ export function findQuoteBoundary(html: string): number | null {
 export function insertBeforeQuote(existingHtml: string, insert: string): string {
 	const at = findQuoteBoundary(existingHtml);
 	if (at !== null) {
-		return `${existingHtml.slice(0, at)}${insert}${existingHtml.slice(at)}`;
+		return `${existingHtml.slice(0, at)}${insert}${QUOTE_SPACER}${existingHtml.slice(at)}`;
 	}
 	return existingHtml.trim() === "" ? insert : `${existingHtml}<br><br>${insert}`;
 }
@@ -160,7 +171,7 @@ export function insertAboveQuote(existingHtml: string, signature: string): strin
 	const block = `${SIGNATURE_MARKER}${signature}`;
 	const at = findQuoteBoundary(existingHtml);
 	if (at !== null) {
-		return `${existingHtml.slice(0, at)}<br><br>${block}${existingHtml.slice(at)}`;
+		return `${existingHtml.slice(0, at)}<br><br>${block}${QUOTE_SPACER}${existingHtml.slice(at)}`;
 	}
 	return existingHtml.trim() === "" ? block : `${existingHtml}<br><br>${block}`;
 }

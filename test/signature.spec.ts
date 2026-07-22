@@ -3,6 +3,7 @@ import {
 	buildBodyWithSignature,
 	bodyContainsSignature,
 	insertAboveQuote,
+	insertBeforeQuote,
 	maybeSign,
 	resolveSignature,
 } from "../src/signature.js";
@@ -175,6 +176,35 @@ describe("insertAboveQuote — reply/forward placement", () => {
 	it("keeps the quoted original intact", () => {
 		const out = insertAboveQuote(`<div>Hi</div>${QUOTED}`, SIG);
 		expect(out).toContain("From: someone@example.com");
+	});
+
+	// Without a spacer the signature butts straight up against Outlook's <hr>
+	// and "From:" header, which reads as the signature having been cut off.
+	it("leaves a gap between the signature and the quote", () => {
+		const out = insertAboveQuote(`<div>Hi</div>${QUOTED}`, SIG);
+		const between = out.slice(
+			out.indexOf("</table>") + "</table>".length,
+			out.indexOf("divRplyFwdMsg"),
+		);
+		expect(between).toContain("<br><br>");
+	});
+
+	it("leaves a gap when splicing arbitrary content before the quote", () => {
+		const body = `<div>Draft</div><div id="appendonsend"></div>${QUOTED}`;
+		const out = insertBeforeQuote(body, "<p>My message</p>");
+		const between = out.slice(
+			out.indexOf("</p>") + "</p>".length,
+			out.indexOf("appendonsend"),
+		);
+		expect(between).toContain("<br><br>");
+	});
+
+	it("does not add a trailing gap when there is no quote to separate from", () => {
+		// A new email ends at the signature — a dangling break below it is just
+		// empty space at the bottom of the message.
+		const out = insertBeforeQuote("<div>Just a body</div>", "<p>Msg</p>");
+		expect(out.endsWith("<br><br>")).toBe(false);
+		expect(out).toBe("<div>Just a body</div><br><br><p>Msg</p>");
 	});
 
 	it("falls back to appending when no quote boundary is recognised", () => {
