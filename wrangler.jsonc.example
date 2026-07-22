@@ -1,0 +1,40 @@
+// Forkers: four values below must be changed to your own before deploying.
+//   1. kv_namespaces[0].id              — `wrangler kv:namespace create OAUTH_KV`
+//   2. vars.MICROSOFT_CLIENT_ID         — Application (client) ID from your Azure AD app registration
+//   3. vars.MICROSOFT_TENANT_ID         — Directory (tenant) ID from your Azure AD; use "common" if you
+//                                          want to support sign-in from any Microsoft account / personal +
+//                                          work / school tenants. The committed value is a specific tenant.
+//   4. vars.WORKER_URL                  — your deployed worker URL (run `wrangler deploy` once to find out,
+//                                          then update and redeploy). Used in OAuth metadata + redirect
+//                                          URI enforcement.
+//
+// The unsafe.bindings[].namespace_id values (3xxx range) can stay as-is unless you operate
+// multiple workers and need separate rate-limiter namespaces.
+//
+// The committed values point at the upstream maintainer's resources — useless to anyone else
+// (Cloudflare scopes KV by API token; Microsoft client IDs are public identifiers but bound to
+// a specific Azure AD app the maintainer controls), but you still need your own to deploy.
+{
+	"name": "outlook-mcp",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-04-28",
+	"compatibility_flags": ["nodejs_compat"],
+	"observability": { "enabled": true },
+	"kv_namespaces": [
+		{ "binding": "OAUTH_KV", "id": "<YOUR_KV_NAMESPACE_ID>" }
+	],
+	"vars": {
+		"MICROSOFT_CLIENT_ID": "<YOUR_AZURE_AD_APPLICATION_CLIENT_ID>",
+		"MICROSOFT_TENANT_ID": "<YOUR_AZURE_AD_DIRECTORY_TENANT_ID_OR_common>",
+		"WORKER_URL": "https://outlook-mcp.<your-account>.workers.dev"
+	},
+	"unsafe": {
+		"bindings": [
+			{ "name": "RATE_LIMIT_APPROVE",     "type": "ratelimit", "namespace_id": "3001", "simple": { "limit": 5,  "period": 60 } },
+			{ "name": "RATE_LIMIT_TOKEN",       "type": "ratelimit", "namespace_id": "3002", "simple": { "limit": 10, "period": 60 } },
+			{ "name": "RATE_LIMIT_REGISTER",    "type": "ratelimit", "namespace_id": "3003", "simple": { "limit": 10, "period": 60 } },
+			{ "name": "RATE_LIMIT_MCP",         "type": "ratelimit", "namespace_id": "3004", "simple": { "limit": 60, "period": 60 } },
+			{ "name": "RATE_LIMIT_OAUTH_START", "type": "ratelimit", "namespace_id": "3005", "simple": { "limit": 5,  "period": 60 } }
+		]
+	}
+}

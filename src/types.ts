@@ -13,6 +13,19 @@ export interface Env {
 	 */
 	MCP_APPROVAL_CODE: string;
 
+	/**
+	 * Optional email signature block, appended by the Worker when a send tool is
+	 * called with `include_signature: true`. Set with `wrangler secret put` — it
+	 * is deployment config, never a committed source file, so a fork does not
+	 * send mail carrying someone else's name and booking links.
+	 *
+	 * May contain the token `__LOGO_URL__`, substituted with SIGNATURE_LOGO_URL.
+	 * Unset means send unsigned mail; it is never an error.
+	 */
+	SIGNATURE_HTML?: string;
+	/** Publicly reachable HTTPS URL of the signature logo. */
+	SIGNATURE_LOGO_URL?: string;
+
 	RATE_LIMIT_APPROVE: CloudflareRateLimiter;
 	RATE_LIMIT_TOKEN: CloudflareRateLimiter;
 	RATE_LIMIT_REGISTER: CloudflareRateLimiter;

@@ -20,6 +20,12 @@ worker-configuration.d.ts
 # Local Claude Code state
 .claude/
 .claude-flow/
+graphify-out/
+
+# Email signature — deployment config, pushed with `wrangler secret put`.
+# Never commit: a fork that inherited this file would send mail carrying the
+# maintainer's name, phone number, and booking links.
+signature-block.html
 
 # Logs
 *.log

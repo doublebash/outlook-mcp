@@ -36,8 +36,8 @@
 		"wrangler": "^4.85.0"
 	},
 	"dependencies": {
-		"@bashco/mcp-toolkit": "^1.0.0",
-		"hono": "^4.12.15",
+		"@bashco/mcp-toolkit": "1.0.0",
+		"hono": "^4.12.31",
 		"zod": "^4.3.6"
 	},
 	"author": "Bashar Basheer",

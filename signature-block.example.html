@@ -1,0 +1,36 @@
+<!--
+  Template for the SIGNATURE_HTML secret.
+
+  Copy to signature-block.html (gitignored), edit with your own details, then:
+      wrangler secret put SIGNATURE_HTML < signature-block.html
+      wrangler secret put SIGNATURE_LOGO_URL
+
+  __LOGO_URL__ is substituted at runtime with the SIGNATURE_LOGO_URL secret.
+  If SIGNATURE_LOGO_URL is unset the <img> is dropped rather than rendered as
+  a broken image. The logo must be publicly reachable over HTTPS — mail
+  clients fetch it from the recipient's machine, with no access to your
+  network or any auth you hold.
+
+  Use inline styles only. <style> blocks are stripped by mail clients, and
+  tables remain the only layout primitive that renders consistently in Outlook.
+-->
+<table cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse; font-family:Arial,Helvetica,sans-serif; color:#222222;">
+  <tr>
+    <td style="vertical-align:top; padding-right:16px;">
+      <img src="__LOGO_URL__" width="70" height="70" alt="Your Company" style="display:block; width:70px; height:70px; border:0;">
+    </td>
+    <td style="vertical-align:top; border-left:2px solid #0066cc; padding-left:16px; line-height:1.45;">
+      <div style="font-size:16px; font-weight:700; color:#222222;">Your Name</div>
+      <div style="font-size:12px; color:#666666; padding:1px 0 7px;">Your Title, Your Company</div>
+      <div style="font-size:12px; color:#222222;">
+        <a href="tel:+000000000" style="color:#222222; text-decoration:none;">000 000 0000</a>
+        &nbsp;&bull;&nbsp;
+        <a href="mailto:you@example.com" style="color:#222222; text-decoration:none;">you@example.com</a>
+      </div>
+      <div style="font-size:12px; padding:6px 0 7px;">
+        <a href="https://example.com/" style="color:#0066cc; text-decoration:none; font-weight:600;">Website</a>
+      </div>
+      <div style="font-size:12px; font-weight:700; letter-spacing:0.4px; color:#222222; padding:2px 0 10px;">YOUR TAGLINE HERE</div>
+    </td>
+  </tr>
+</table>

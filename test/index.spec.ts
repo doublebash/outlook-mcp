@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { SELF } from "cloudflare:test";
 import { htmlToText } from "../src/sanitize.js";
 import {
@@ -6,6 +6,7 @@ import {
 	rejectIfPrivateHost,
 	normaliseIpHostname,
 	validateAndBuildAttachments,
+	resolveAndValidateAttachments,
 } from "../src/email-helpers.js";
 import { buildRecurrence } from "../src/calendar-helpers.js";
 import { parseVtt } from "../src/transcript-helpers.js";
@@ -241,6 +242,153 @@ describe("validateAndBuildAttachments", () => {
 		expect(built).toHaveLength(1);
 		expect(built[0]?.["@odata.type"]).toBe("#microsoft.graph.fileAttachment");
 		expect(built[0]?.contentType).toBe("image/png");
+	});
+});
+
+// ── SSRF: per-hop redirect revalidation ───────────────────────────────────────
+//
+// rejectIfPrivateHost is covered above, but the loop that CALLS it on each
+// redirect target is the actual defence — a public URL that 302s to a private
+// IP is the whole attack. These drive it through the exported public API
+// (resolveAndValidateAttachments → fetchAsBase64FromUrl) rather than reaching
+// into the module, so the guard stays tested even if the private helper is
+// renamed.
+
+describe("fetchAsBase64FromUrl — SSRF redirect revalidation", () => {
+	const env = {} as never;
+	const PNG = btoa("hello");
+
+	function attach(url: string) {
+		return [{ name: "a.png", url, content_type: "image/png" }];
+	}
+
+	function redirectTo(location: string, status = 302): Response {
+		return new Response(null, { status, headers: { location } });
+	}
+
+	function okPng(): Response {
+		return new Response(new Uint8Array([104, 101, 108, 108, 111]), {
+			status: 200,
+			headers: { "content-type": "image/png" },
+		});
+	}
+
+	let fetchMock: ReturnType<typeof vi.fn>;
+
+	beforeEach(() => {
+		fetchMock = vi.fn();
+		vi.stubGlobal("fetch", fetchMock);
+	});
+
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
+	it("uses manual redirect handling so each hop can be revalidated", async () => {
+		fetchMock.mockResolvedValueOnce(okPng());
+		await resolveAndValidateAttachments(env, attach("https://example.com/a.png"));
+
+		// If this were "follow", the platform would chase redirects internally and
+		// no per-hop validation could ever run. That makes it a security assertion,
+		// not a style one.
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ redirect: "manual" });
+	});
+
+	it("blocks a public URL that redirects to a private IP", async () => {
+		fetchMock.mockResolvedValueOnce(redirectTo("https://10.0.0.5/secret"));
+
+		await expect(
+			resolveAndValidateAttachments(env, attach("https://example.com/a.png")),
+		).rejects.toThrow(/private IP/);
+
+		// Rejected on the redirect target — the second hop is never fetched.
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("blocks a redirect to the cloud metadata endpoint", async () => {
+		fetchMock.mockResolvedValueOnce(redirectTo("https://169.254.169.254/latest/meta-data/"));
+
+		await expect(
+			resolveAndValidateAttachments(env, attach("https://example.com/a.png")),
+		).rejects.toThrow(/private IP/);
+	});
+
+	it("blocks a redirect to localhost", async () => {
+		fetchMock.mockResolvedValueOnce(redirectTo("https://localhost/admin"));
+
+		await expect(
+			resolveAndValidateAttachments(env, attach("https://example.com/a.png")),
+		).rejects.toThrow(/internal hostname/);
+	});
+
+	it("blocks a redirect that downgrades to http", async () => {
+		fetchMock.mockResolvedValueOnce(redirectTo("http://example.com/a.png"));
+
+		await expect(
+			resolveAndValidateAttachments(env, attach("https://example.com/a.png")),
+		).rejects.toThrow(/Only https/);
+	});
+
+	it("revalidates on a relative Location header resolved against the current URL", async () => {
+		// A bare path must be resolved before validation, not skipped as "no host".
+		fetchMock
+			.mockResolvedValueOnce(redirectTo("/next"))
+			.mockResolvedValueOnce(okPng());
+
+		await resolveAndValidateAttachments(env, attach("https://example.com/a.png"));
+
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(fetchMock.mock.calls[1]?.[0]).toBe("https://example.com/next");
+	});
+
+	it("blocks a private IP reached via a decimal-encoded redirect", async () => {
+		// 2130706433 === 127.0.0.1; normalisation must happen on the hop target too.
+		fetchMock.mockResolvedValueOnce(redirectTo("https://2130706433/admin"));
+
+		await expect(
+			resolveAndValidateAttachments(env, attach("https://example.com/a.png")),
+		).rejects.toThrow(/private IP/);
+	});
+
+	it("allows a public → public redirect chain within the hop limit", async () => {
+		fetchMock
+			.mockResolvedValueOnce(redirectTo("https://cdn.example.com/a.png"))
+			.mockResolvedValueOnce(redirectTo("https://cdn2.example.com/a.png"))
+			.mockResolvedValueOnce(okPng());
+
+		const built = await resolveAndValidateAttachments(
+			env,
+			attach("https://example.com/a.png"),
+		);
+
+		expect(fetchMock).toHaveBeenCalledTimes(3);
+		expect(built).toHaveLength(1);
+		expect(built[0]?.contentBytes).toBe(PNG);
+	});
+
+	it("stops after MAX_REDIRECTS hops", async () => {
+		fetchMock.mockResolvedValue(redirectTo("https://example.com/loop"));
+
+		await expect(
+			resolveAndValidateAttachments(env, attach("https://example.com/a.png")),
+		).rejects.toThrow(/Too many redirects/);
+	});
+
+	it("rejects a redirect with no Location header", async () => {
+		fetchMock.mockResolvedValueOnce(new Response(null, { status: 302 }));
+
+		await expect(
+			resolveAndValidateAttachments(env, attach("https://example.com/a.png")),
+		).rejects.toThrow(/no Location header/);
+	});
+
+	it("rejects a private IP supplied directly, before any fetch", async () => {
+		await expect(
+			resolveAndValidateAttachments(env, attach("https://192.168.1.1/a.png")),
+		).rejects.toThrow(/private IP/);
+
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 });
 

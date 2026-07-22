@@ -6,7 +6,7 @@ Fork this repo, deploy to your own Cloudflare account, register a Microsoft Azur
 
 Built on [`@bashco/mcp-toolkit`](https://github.com/doublebash/mcp-toolkit) — OAuth, per-client bearer tokens, rate limiting, structured logging, typed tool dispatch are all handled by the shared library.
 
-## What Claude gets — 33 tools across 7 domains
+## What Claude gets — 38 tools across 7 domains
 
 - **Mail**: list emails, read email, search, reply, forward, delete, send, move between folders, create draft, update draft, send draft, schedule send
 - **Calendar**: list events, list event occurrences, create, update, delete, cancel event, respond to event
@@ -60,6 +60,12 @@ id = "abc123def456..."
 ```
 
 Edit `wrangler.jsonc` and replace the existing `id` under `kv_namespaces` with what wrangler just printed.
+
+> `wrangler.jsonc` is committed by design — Wrangler and the CI deploy both need
+> it, and it holds no secrets (only your KV namespace id, public Azure client id,
+> and worker URL). `wrangler.jsonc.example` carries the same structure with
+> placeholders if you'd rather start from a clean copy. Real secrets go through
+> `wrangler secret put` and never appear in this file.
 
 ### 3. Register a Microsoft Azure AD app
 
@@ -115,6 +121,8 @@ wrangler secret put MICROSOFT_CLIENT_SECRET    # from Step 3.8
 |---|---|
 | `MCP_APPROVAL_CODE`        | One-time code you paste at `/authorize` to mint a Claude bearer. Also used as the encryption secret for upstream Microsoft tokens at rest — rotating it invalidates stored tokens and forces clean Microsoft re-auth. |
 | `MICROSOFT_CLIENT_SECRET`  | Your Azure AD app's client secret. |
+| `SIGNATURE_HTML`           | Optional. Email signature block appended server-side — see [Email signature](#email-signature). |
+| `SIGNATURE_LOGO_URL`       | Optional. Publicly reachable HTTPS URL of the signature logo. |
 
 ### 6. First deploy (to learn worker URL)
 
@@ -150,13 +158,79 @@ You can confirm the connection by visiting `<your-worker-url>/oauth/status` — 
 2. Server URL: `<your-worker-url>/mcp`
 3. Claude.ai redirects you to your worker's `/authorize` page
 4. Paste your `MCP_APPROVAL_CODE` and confirm
-5. You're connected — Claude now has the 33 Outlook + Teams tools available
+5. You're connected — Claude now has the 38 Outlook + Teams tools available
+
+## Email signature
+
+Optional. When configured, the Worker appends your signature at send time so
+the calling agent never has to reproduce it — it can't be paraphrased,
+truncated, or forgotten.
+
+Pass `include_signature: true` to any of `send_email`, `schedule_send`,
+`reply_to_email`, `forward_email`, `create_reply_draft`,
+`create_reply_all_draft`, or `create_forward_draft`. It defaults to `false`,
+so existing callers are unaffected.
+
+### Setup
+
+```bash
+cp signature-block.example.html signature-block.html   # then edit it
+wrangler secret put SIGNATURE_HTML < signature-block.html
+wrangler secret put SIGNATURE_LOGO_URL                 # paste your HTTPS logo URL
+```
+
+`signature-block.html` is **gitignored on purpose**. The signature is
+deployment config, not source: a fork that inherited a committed signature
+would send mail carrying someone else's name, phone number, and booking links.
+Only the placeholder `signature-block.example.html` is committed.
+
+The `__LOGO_URL__` token inside `SIGNATURE_HTML` is substituted with
+`SIGNATURE_LOGO_URL` at runtime.
+
+**The logo must be publicly reachable over HTTPS.** Mail clients fetch it from
+the *recipient's* machine — it has no access to your network, your Worker's
+bindings, or any credential you hold. A private, authenticated, or
+`localhost` URL renders as a broken image for everyone. If
+`SIGNATURE_LOGO_URL` is unset the `<img>` is dropped entirely rather than
+emitting a broken `src`.
+
+If `SIGNATURE_HTML` is unset the flag is a silent no-op — the mail sends
+unsigned. An unconfigured deployment never errors.
+
+### Behaviour
+
+- **Forces HTML.** A signature inside a plain-text body renders as visible raw
+  markup, so `body_type` is overridden to `html` whenever the flag is set. When
+  you explicitly passed `body_type: "text"` the override is reported back in the
+  tool response's `notes`, never applied silently.
+- **Plain-text bodies are escaped, then newlines become `<br>`**, so your line
+  breaks survive the forced HTML switch and stray `<` characters can't become
+  markup.
+- **Idempotent.** If the body already carries the signature — recognised by the
+  Worker's own marker or by the signature's distinctive text — it is not
+  appended twice.
+- **Replies and forwards** place the signature above the quoted original, not at
+  the bottom of the whole thread.
+- **Empty body** sends the signature alone, with no leading blank lines.
+
+### Security note
+
+The signature is concatenated **after** the caller's body has been sanitised.
+This is deliberate and load-bearing: `sanitizeOutboundHtml` strips every
+`style=` attribute (an attribute-only XSS sink), and the signature is built
+entirely from inline styles, so routing it through the sanitiser would strip
+the logo sizing, the divider, and the CTA buttons.
+
+The two strings have different trust levels. The body is agent-supplied and
+untrusted, so it is still fully sanitised. The signature is operator-supplied
+deployment config set via `wrangler secret put` — anyone who can set that
+secret can already change the Worker outright. See `src/signature.ts`.
 
 ## Local development
 
 ```bash
 cp .dev.vars.example .dev.vars   # fill in MCP_APPROVAL_CODE + MICROSOFT_CLIENT_SECRET; .dev.vars is gitignored
-npm test                          # 48 tests via vitest with workers pool
+npm test                          # 145 tests via vitest with workers pool
 npm run typecheck                 # tsc --noEmit
 npm run dev                       # wrangler dev — local at http://localhost:8787
 ```
@@ -180,7 +254,7 @@ npm run dev                       # wrangler dev — local at http://localhost:8
 - TypeScript (strict)
 - [Hono](https://hono.dev) v4
 - [Zod](https://zod.dev) v4
-- Vitest with `@cloudflare/vitest-pool-workers` (48 tests)
+- Vitest with `@cloudflare/vitest-pool-workers` (145 tests)
 - [`@bashco/mcp-toolkit`](https://github.com/doublebash/mcp-toolkit) — shared OAuth/crypto/rate-limit/dispatch plumbing
 
 ## Security architecture highlights

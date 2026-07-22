@@ -8,6 +8,14 @@ import {
 } from "../email-helpers.js";
 import { graphDelete, graphGet, graphPatch, graphPost } from "../graph.js";
 import { sanitizeDraftMessage, sanitizeEmailFull, sanitizeEmailList } from "../sanitize.js";
+import {
+	buildBodyWithSignature,
+	findQuoteBoundary,
+	insertBeforeQuote,
+	maybeSign,
+	renderBodyHtml,
+	resolveSignature,
+} from "../signature.js";
 import type { Env } from "../types.js";
 import {
 	ATTACHMENTS_DESC,
@@ -30,22 +38,42 @@ const folderSchema = z
 	.optional();
 const emailIdSchema = z.string().min(1).max(512);
 
+// Opt-in server-side signature. Default false so existing callers are
+// unaffected. The signature itself lives in deployment config (SIGNATURE_HTML),
+// never in this repo — see src/signature.ts.
+const includeSignatureSchema = z.boolean().optional().default(false);
+const INCLUDE_SIGNATURE_DESC =
+	"Append the sender's configured email signature server-side. Do NOT write the signature into `body` yourself — set this flag and the Worker adds it verbatim. Forces the body to HTML (a signature in a plain-text body renders as raw markup). No-op if the deployment has no signature configured. Default false.";
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 // Build the Graph "message" object from common args. Attachments are NOT
 // included here — they are uploaded separately via uploadAttachmentsToDraft
 // because they may need server-side fetching (OneDrive / URL).
-function buildMessageObject(args: {
-	to?: string;
-	cc?: string;
-	bcc?: string;
-	subject?: string;
-	body?: string;
-	body_type?: string;
-}): Record<string, unknown> {
+function buildMessageObject(
+	args: {
+		to?: string;
+		cc?: string;
+		bcc?: string;
+		subject?: string;
+		body?: string;
+		body_type?: string;
+		include_signature?: boolean;
+	},
+	env?: Env,
+	notes?: string[],
+): Record<string, unknown> {
 	const message: Record<string, unknown> = {};
 	if (args.subject !== undefined) message.subject = args.subject;
-	if (args.body !== undefined) {
+
+	// Signature path replaces the normal body build: the signature must be
+	// concatenated after sanitisation (see src/signature.ts), so it cannot go
+	// through buildMessageBody.
+	const signed = env ? maybeSign(env, args.include_signature, args.body, args.body_type) : null;
+	if (signed) {
+		message.body = { contentType: signed.contentType, content: signed.content };
+		notes?.push(...signed.notes);
+	} else if (args.body !== undefined) {
 		message.body = buildMessageBody(args.body, args.body_type);
 	}
 	if (args.to !== undefined) message.toRecipients = buildRecipients(args.to);
@@ -54,6 +82,92 @@ function buildMessageObject(args: {
 	if (cc.length) message.ccRecipients = cc;
 	if (bcc.length) message.bccRecipients = bcc;
 	return message;
+}
+
+// Attach signature-related notes (e.g. a body_type override) to a tool result
+// so the caller sees what the Worker changed instead of it happening silently.
+function withNotes(
+	result: Record<string, unknown>,
+	notes: string[],
+): Record<string, unknown> {
+	const unique = [...new Set(notes)];
+	return unique.length > 0 ? { ...result, notes: unique } : result;
+}
+
+/**
+ * Compose the outgoing body for a reply/forward draft that Graph has already
+ * generated.
+ *
+ * Graph's createReply/createReplyAll/createForward draft already contains the
+ * quoted original. PATCHing `body` with just the author's new text REPLACES
+ * that whole document, which silently discards the conversation history — the
+ * recipient gets a bare reply with no "On <date>, X wrote:" beneath it.
+ *
+ * So instead of replacing, we read the generated body back and insert the new
+ * content ABOVE the quote boundary, leaving the quote intact below. This is
+ * why replies are always HTML: the generated quote block is HTML, and a Text
+ * body cannot carry it.
+ *
+ * Returns undefined when there is nothing to write (no body, no signature), so
+ * the caller leaves Graph's draft untouched.
+ */
+async function composeThreadBody(
+	env: Env,
+	draftId: string,
+	args: { body?: string; body_type?: string; include_signature?: boolean },
+	notes: string[],
+): Promise<{ contentType: "HTML"; content: string } | undefined> {
+	const signature = args.include_signature ? resolveSignature(env) : null;
+
+	// The author's own content, rendered and (when asked) signed.
+	let top: string;
+	if (signature) {
+		const built = buildBodyWithSignature(args.body, args.body_type, signature);
+		notes.push(...built.notes);
+		top = built.content;
+	} else {
+		if (args.body === undefined) return undefined;
+		top = renderBodyHtml(args.body, args.body_type);
+	}
+
+	if (args.body !== undefined && (args.body_type ?? "text").toLowerCase() !== "html") {
+		notes.push(
+			"Sent as HTML so the quoted original could be preserved below your message.",
+		);
+	}
+
+	let generated = "";
+	try {
+		const raw = (await graphGet(env, `/me/messages/${draftId}`, { $select: "body" })) as {
+			body?: { content?: string } | null;
+		};
+		generated = raw.body?.content ?? "";
+	} catch {
+		// Reading the draft failed. Fall back to the author's content alone
+		// rather than failing the send, but say so — the quote will be missing.
+		notes.push(
+			"Could not read the generated draft, so the quoted original is not included below your message.",
+		);
+		return { contentType: "HTML", content: top };
+	}
+
+	if (generated.trim() === "") return { contentType: "HTML", content: top };
+
+	if (findQuoteBoundary(generated) !== null) {
+		return { contentType: "HTML", content: insertBeforeQuote(generated, top) };
+	}
+
+	// No recognisable boundary: treat the whole generated document as the quote
+	// and place the new content at the top of it, inside <body> when present.
+	const bodyOpen = /<body\b[^>]*>/i.exec(generated);
+	if (bodyOpen) {
+		const at = bodyOpen.index + bodyOpen[0].length;
+		return {
+			contentType: "HTML",
+			content: `${generated.slice(0, at)}${top}<br><br>${generated.slice(at)}`,
+		};
+	}
+	return { contentType: "HTML", content: `${top}<br><br>${generated}` };
 }
 
 async function uploadAttachmentsToDraft(
@@ -115,6 +229,7 @@ async function sendEmailImpl(
 		cc?: string;
 		bcc?: string;
 		attachments?: unknown[];
+		include_signature?: boolean;
 	},
 ): Promise<unknown> {
 	// If the message has attachments we must use the create-draft-then-send
@@ -122,14 +237,20 @@ async function sendEmailImpl(
 	// can have attachments uploaded individually and are not subject to that
 	// single-request cap.
 	const hasAttachments = Array.isArray(args.attachments) && args.attachments.length > 0;
+	const notes: string[] = [];
 
 	if (!hasAttachments) {
-		await graphPost(env, "/me/sendMail", { message: buildMessageObject(args) });
-		auditLog("email_sent", { to: args.to, subject: args.subject, attachments: 0 });
-		return { success: true, message: "Email sent." };
+		await graphPost(env, "/me/sendMail", { message: buildMessageObject(args, env, notes) });
+		auditLog("email_sent", {
+			to: args.to,
+			subject: args.subject,
+			attachments: 0,
+			signed: !!args.include_signature,
+		});
+		return withNotes({ success: true, message: "Email sent." }, notes);
 	}
 
-	const draft = (await graphPost(env, "/me/messages", buildMessageObject(args))) as {
+	const draft = (await graphPost(env, "/me/messages", buildMessageObject(args, env, notes))) as {
 		id: string;
 	};
 	await uploadAttachmentsToDraft(env, draft.id, args.attachments);
@@ -139,8 +260,9 @@ async function sendEmailImpl(
 		subject: args.subject,
 		attachments: args.attachments!.length,
 		attachment_sources: summariseAttachmentSources(args.attachments),
+		signed: !!args.include_signature,
 	});
-	return { success: true, message: "Email sent." };
+	return withNotes({ success: true, message: "Email sent." }, notes);
 }
 
 type GraphRecipient = { emailAddress: { address: string } };
@@ -212,9 +334,11 @@ async function replyToEmailImpl(
 		body_type?: string;
 		reply_all?: boolean;
 		attachments?: unknown[];
+		include_signature?: boolean;
 	},
 ): Promise<unknown> {
 	const action = args.reply_all ? "createReplyAll" : "createReply";
+	const notes: string[] = [];
 
 	// Fetch the original sender/recipients and the mailbox owner alongside
 	// creating the reply draft, so we can fix the reply-to-self bounce below.
@@ -226,9 +350,9 @@ async function replyToEmailImpl(
 		graphPost(env, `/me/messages/${args.id}/${action}`) as Promise<{ id: string }>,
 	]);
 
-	const updates: Record<string, unknown> = {
-		body: buildMessageBody(args.body, args.body_type),
-	};
+	const updates: Record<string, unknown> = {};
+	const composed = await composeThreadBody(env, draft.id, args, notes);
+	if (composed) updates.body = composed;
 
 	const override = owner
 		? computeSelfReplyRecipients(original, owner, !!args.reply_all)
@@ -263,8 +387,9 @@ async function replyToEmailImpl(
 		self_reply_redirected: !!override,
 		attachments: args.attachments?.length ?? 0,
 		attachment_sources: summariseAttachmentSources(args.attachments),
+		signed: !!args.include_signature,
 	});
-	return { success: true, message: "Reply sent." };
+	return withNotes({ success: true, message: "Reply sent." }, notes);
 }
 
 async function forwardEmailImpl(
@@ -277,8 +402,10 @@ async function forwardEmailImpl(
 		cc?: string;
 		bcc?: string;
 		attachments?: unknown[];
+		include_signature?: boolean;
 	},
 ): Promise<unknown> {
+	const notes: string[] = [];
 	const draft = (await graphPost(env, `/me/messages/${args.id}/createForward`)) as {
 		id: string;
 	};
@@ -290,9 +417,9 @@ async function forwardEmailImpl(
 	const bcc = buildRecipients(args.bcc);
 	if (cc.length) updates.ccRecipients = cc;
 	if (bcc.length) updates.bccRecipients = bcc;
-	if (args.body) {
-		updates.body = buildMessageBody(args.body, args.body_type);
-	}
+
+	const composed = await composeThreadBody(env, draft.id, args, notes);
+	if (composed) updates.body = composed;
 	await graphPatch(env, `/me/messages/${draft.id}`, updates);
 
 	if (args.attachments && args.attachments.length > 0) {
@@ -305,8 +432,9 @@ async function forwardEmailImpl(
 		to: args.to,
 		additional_attachments: args.attachments?.length ?? 0,
 		attachment_sources: summariseAttachmentSources(args.attachments),
+		signed: !!args.include_signature,
 	});
-	return { success: true, message: "Email forwarded." };
+	return withNotes({ success: true, message: "Email forwarded." }, notes);
 }
 
 // ── Threaded draft replies/forwards ─────────────────────────────────────────────
@@ -392,9 +520,16 @@ async function finaliseThreadDraft(
 
 export async function createReplyDraftImpl(
 	env: Env,
-	args: { id: string; body?: string; body_type?: string; reply_all?: boolean },
+	args: {
+		id: string;
+		body?: string;
+		body_type?: string;
+		reply_all?: boolean;
+		include_signature?: boolean;
+	},
 ): Promise<unknown> {
 	const action = args.reply_all ? "createReplyAll" : "createReply";
+	const notes: string[] = [];
 
 	let draft: { id: string };
 	try {
@@ -416,9 +551,8 @@ export async function createReplyDraftImpl(
 	]);
 
 	const updates: Record<string, unknown> = {};
-	if (args.body !== undefined) {
-		updates.body = buildMessageBody(args.body, args.body_type);
-	}
+	const composed = await composeThreadBody(env, draft.id, args, notes);
+	if (composed) updates.body = composed;
 
 	const override = owner
 		? computeSelfReplyRecipients(original, owner, !!args.reply_all)
@@ -440,14 +574,16 @@ export async function createReplyDraftImpl(
 		updates.ccRecipients = override.ccRecipients;
 	}
 
-	return finaliseThreadDraft(env, draft.id, updates, {
+	const result = await finaliseThreadDraft(env, draft.id, updates, {
 		event: "reply_draft_created",
 		details: {
 			in_reply_to: args.id,
 			reply_all: !!args.reply_all,
 			self_reply_redirected: !!override,
+			signed: !!args.include_signature,
 		},
 	});
+	return withNotes(result, notes);
 }
 
 export async function createForwardDraftImpl(
@@ -459,8 +595,10 @@ export async function createForwardDraftImpl(
 		bcc?: string;
 		body?: string;
 		body_type?: string;
+		include_signature?: boolean;
 	},
 ): Promise<unknown> {
+	const notes: string[] = [];
 	let draft: { id: string };
 	try {
 		draft = (await graphPost(env, `/me/messages/${args.id}/createForward`)) as {
@@ -476,14 +614,15 @@ export async function createForwardDraftImpl(
 	const bcc = buildRecipients(args.bcc);
 	if (cc.length) updates.ccRecipients = cc;
 	if (bcc.length) updates.bccRecipients = bcc;
-	if (args.body !== undefined) {
-		updates.body = buildMessageBody(args.body, args.body_type);
-	}
 
-	return finaliseThreadDraft(env, draft.id, updates, {
+	const composed = await composeThreadBody(env, draft.id, args, notes);
+	if (composed) updates.body = composed;
+
+	const result = await finaliseThreadDraft(env, draft.id, updates, {
 		event: "forward_draft_created",
-		details: { forwarded_from: args.id },
+		details: { forwarded_from: args.id, signed: !!args.include_signature },
 	});
+	return withNotes(result, notes);
 }
 
 async function deleteEmailImpl(env: Env, args: { id: string }): Promise<unknown> {
@@ -604,6 +743,7 @@ async function scheduleSendImpl(
 		bcc?: string;
 		attachments?: unknown[];
 		send_at: string;
+		include_signature?: boolean;
 	},
 ): Promise<unknown> {
 	const sendAtDate = new Date(args.send_at);
@@ -614,7 +754,8 @@ async function scheduleSendImpl(
 		throw ToolError.validation("send_at must be in the future");
 	}
 
-	const message = buildMessageObject(args);
+	const notes: string[] = [];
+	const message = buildMessageObject(args, env, notes);
 	message.singleValueExtendedProperties = [
 		{ id: PR_DEFERRED_SEND_TIME, value: sendAtDate.toISOString() },
 	];
@@ -633,12 +774,16 @@ async function scheduleSendImpl(
 		subject: args.subject,
 		attachments: args.attachments?.length ?? 0,
 		attachment_sources: summariseAttachmentSources(args.attachments),
+		signed: !!args.include_signature,
 	});
-	return {
-		success: true,
-		message: `Email scheduled for ${sendAtDate.toISOString()}. The mail server will hold it until then.`,
-		scheduled_id: draft.id,
-	};
+	return withNotes(
+		{
+			success: true,
+			message: `Email scheduled for ${sendAtDate.toISOString()}. The mail server will hold it until then.`,
+			scheduled_id: draft.id,
+		},
+		notes,
+	);
 }
 
 async function getConversationImpl(
@@ -711,6 +856,7 @@ export const emailTools = defineTools<Env>({
 			cc: z.string().max(2048).optional(),
 			bcc: z.string().max(2048).optional(),
 			attachments: z.array(attachmentSchema).max(20).optional(),
+			include_signature: includeSignatureSchema.describe(INCLUDE_SIGNATURE_DESC),
 		}),
 		handler: (env, args) => sendEmailImpl(env, args),
 	},
@@ -723,6 +869,7 @@ export const emailTools = defineTools<Env>({
 			body_type: bodyTypeSchema,
 			reply_all: z.boolean().optional(),
 			attachments: z.array(attachmentSchema).max(20).optional(),
+			include_signature: includeSignatureSchema.describe(INCLUDE_SIGNATURE_DESC),
 		}),
 		handler: (env, args) => replyToEmailImpl(env, args),
 	},
@@ -737,6 +884,7 @@ export const emailTools = defineTools<Env>({
 			cc: z.string().max(2048).optional(),
 			bcc: z.string().max(2048).optional(),
 			attachments: z.array(attachmentSchema).max(20).optional(),
+			include_signature: includeSignatureSchema.describe(INCLUDE_SIGNATURE_DESC),
 		}),
 		handler: (env, args) => forwardEmailImpl(env, args),
 	},
@@ -747,6 +895,7 @@ export const emailTools = defineTools<Env>({
 			id: emailIdSchema,
 			body: z.string().max(2 * 1024 * 1024).optional(),
 			body_type: bodyTypeSchema,
+			include_signature: includeSignatureSchema.describe(INCLUDE_SIGNATURE_DESC),
 		}),
 		handler: (env, args) => createReplyDraftImpl(env, args),
 	},
@@ -757,6 +906,7 @@ export const emailTools = defineTools<Env>({
 			id: emailIdSchema,
 			body: z.string().max(2 * 1024 * 1024).optional(),
 			body_type: bodyTypeSchema,
+			include_signature: includeSignatureSchema.describe(INCLUDE_SIGNATURE_DESC),
 		}),
 		handler: (env, args) => createReplyDraftImpl(env, { ...args, reply_all: true }),
 	},
@@ -770,6 +920,7 @@ export const emailTools = defineTools<Env>({
 			bcc: z.string().max(2048).optional(),
 			body: z.string().max(2 * 1024 * 1024).optional(),
 			body_type: bodyTypeSchema,
+			include_signature: includeSignatureSchema.describe(INCLUDE_SIGNATURE_DESC),
 		}),
 		handler: (env, args) => createForwardDraftImpl(env, args),
 	},
@@ -835,6 +986,7 @@ export const emailTools = defineTools<Env>({
 			bcc: z.string().max(2048).optional(),
 			attachments: z.array(attachmentSchema).max(20).optional(),
 			send_at: z.string().min(1).max(64),
+			include_signature: includeSignatureSchema.describe(INCLUDE_SIGNATURE_DESC),
 		}),
 		handler: (env, args) => scheduleSendImpl(env, args),
 	},

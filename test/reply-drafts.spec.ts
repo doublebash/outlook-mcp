@@ -68,6 +68,112 @@ beforeEach(() => {
 	);
 });
 
+// Graph's createReply/createForward draft already contains the quoted original.
+// Historically the tools PATCHed `body` with just the author's new text, which
+// replaced that whole document and silently discarded the conversation history.
+// These lock in the fix: the new content goes ABOVE the quote, quote intact.
+describe("quoted original is preserved", () => {
+	const QUOTE =
+		'<div id="divRplyFwdMsg">From: adam@example.com<br>Sent: Monday<br>Subject: Quarterly numbers</div><div>Original message text.</div>';
+	const GENERATED = `<html><body><div></div><div id="appendonsend"></div><hr>${QUOTE}</body></html>`;
+
+	function withGeneratedBody() {
+		const base = vi.mocked(graphGet).getMockImplementation()!;
+		vi.mocked(graphGet).mockImplementation(async (e: unknown, path: string, q?: unknown) => {
+			const query = q as { $select?: string } | undefined;
+			if (path === `/me/messages/${DRAFT_ID}` && query?.$select === "body") {
+				return { body: { contentType: "HTML", content: GENERATED } };
+			}
+			return base(e, path, q);
+		});
+	}
+
+	function patchedBody(): string {
+		const call = vi.mocked(graphPatch).mock.calls.at(-1);
+		const updates = call?.[2] as { body?: { content?: string } };
+		return updates.body?.content ?? "";
+	}
+
+	it("keeps the quoted original when replying with a body", async () => {
+		withGeneratedBody();
+		await createReplyDraftImpl(env, { id: ORIG_OTHER, body: "Thanks, noted." });
+
+		const content = patchedBody();
+		expect(content).toContain("Original message text.");
+		expect(content).toContain("From: adam@example.com");
+	});
+
+	it("places the reply above the quote, not below it", async () => {
+		withGeneratedBody();
+		await createReplyDraftImpl(env, { id: ORIG_OTHER, body: "Thanks, noted." });
+
+		const content = patchedBody();
+		expect(content.indexOf("Thanks, noted.")).toBeLessThan(content.indexOf("divRplyFwdMsg"));
+	});
+
+	it("keeps the quoted original when forwarding with a comment", async () => {
+		withGeneratedBody();
+		await createForwardDraftImpl(env, {
+			id: ORIG_OTHER,
+			to: "bob@example.com",
+			body: "FYI",
+		});
+
+		const content = patchedBody();
+		expect(content).toContain("Original message text.");
+		expect(content.indexOf("FYI")).toBeLessThan(content.indexOf("divRplyFwdMsg"));
+	});
+
+	it("converts a plain-text reply to HTML so the quote can be carried", async () => {
+		withGeneratedBody();
+		await createReplyDraftImpl(env, {
+			id: ORIG_OTHER,
+			body: "line one\nline two",
+			body_type: "text",
+		});
+
+		const call = vi.mocked(graphPatch).mock.calls.at(-1);
+		const updates = call?.[2] as { body?: { contentType?: string; content?: string } };
+		expect(updates.body?.contentType).toBe("HTML");
+		expect(updates.body?.content).toContain("line one<br>line two");
+		expect(updates.body?.content).toContain("Original message text.");
+	});
+
+	it("still sanitises the author's HTML while keeping the quote", async () => {
+		withGeneratedBody();
+		await createReplyDraftImpl(env, {
+			id: ORIG_OTHER,
+			body: '<p onclick="x()">Hi</p><script>alert(1)</script>',
+			body_type: "html",
+		});
+
+		const content = patchedBody();
+		expect(content).not.toContain("<script");
+		expect(content).not.toContain("onclick");
+		expect(content).toContain("Original message text.");
+	});
+
+	it("falls back to the author's text when the draft body cannot be read", async () => {
+		const base = vi.mocked(graphGet).getMockImplementation()!;
+		vi.mocked(graphGet).mockImplementation(async (e: unknown, path: string, q?: unknown) => {
+			const query = q as { $select?: string } | undefined;
+			if (path === `/me/messages/${DRAFT_ID}` && query?.$select === "body") {
+				throw new Error("Graph 500");
+			}
+			return base(e, path, q);
+		});
+
+		// The reply must still go out — losing the quote beats losing the draft.
+		const result = (await createReplyDraftImpl(env, {
+			id: ORIG_OTHER,
+			body: "Thanks, noted.",
+		})) as Record<string, unknown>;
+
+		expect(patchedBody()).toContain("Thanks, noted.");
+		expect(JSON.stringify(result.notes)).toMatch(/quoted original is not included/);
+	});
+});
+
 describe("create_reply_draft", () => {
 	it("calls POST /me/messages/{id}/createReply", async () => {
 		await createReplyDraftImpl(env, { id: ORIG_OTHER });
@@ -197,7 +303,9 @@ describe("create_forward_draft", () => {
 			expect.objectContaining({
 				toRecipients: [{ emailAddress: { address: "bob@example.com" } }],
 				ccRecipients: [{ emailAddress: { address: "carol@example.com" } }],
-				body: { contentType: "Text", content: "FYI" },
+				// HTML, not Text: the outgoing body has to carry Graph's quoted
+			// original below the comment, and a Text body cannot.
+			body: { contentType: "HTML", content: "FYI" },
 			}),
 		);
 	});
