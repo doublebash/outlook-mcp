@@ -178,6 +178,16 @@ applies when you also pass a new `body` (otherwise there is nothing to sign, and
 it would replace the draft with a signature-only body); that case is reported in
 the response `notes` rather than silently wiping the draft.
 
+### Calendar invites
+
+`create_calendar_event` and `update_calendar_event` accept the same
+`include_signature` flag, appending the signature to the event **description**.
+It reuses the same `SIGNATURE_HTML` block as email — including its marketing
+call-to-action buttons — so it suits a client-facing invite more than an
+internal meeting; that is why it is opt-in per event. `update_calendar_event`
+follows the same guard as `update_draft`: the flag only applies when you also
+pass a new `description`.
+
 ### Setup
 
 ```bash
@@ -237,7 +247,7 @@ secret can already change the Worker outright. See `src/signature.ts`.
 
 ```bash
 cp .dev.vars.example .dev.vars   # fill in MCP_APPROVAL_CODE + MICROSOFT_CLIENT_SECRET; .dev.vars is gitignored
-npm test                          # 145 tests via vitest with workers pool
+npm test                          # 171 tests via vitest with workers pool
 npm run typecheck                 # tsc --noEmit
 npm run dev                       # wrangler dev — local at http://localhost:8787
 ```
@@ -261,7 +271,7 @@ npm run dev                       # wrangler dev — local at http://localhost:8
 - TypeScript (strict)
 - [Hono](https://hono.dev) v4
 - [Zod](https://zod.dev) v4
-- Vitest with `@cloudflare/vitest-pool-workers` (145 tests)
+- Vitest with `@cloudflare/vitest-pool-workers` (171 tests)
 - [`@bashco/mcp-toolkit`](https://github.com/doublebash/mcp-toolkit) — shared OAuth/crypto/rate-limit/dispatch plumbing
 
 ## Security architecture highlights

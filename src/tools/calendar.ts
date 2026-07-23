@@ -4,6 +4,7 @@ import { buildRecurrence, type RecurrenceInput } from "../calendar-helpers.js";
 import { buildMessageBody } from "../email-helpers.js";
 import { graphDelete, graphGet, graphPatch, graphPost } from "../graph.js";
 import { sanitizeEventList } from "../sanitize.js";
+import { maybeSign } from "../signature.js";
 import type { Env } from "../types.js";
 import {
 	BODY_TYPE_DESC,
@@ -11,6 +12,14 @@ import {
 	escapeOdataString,
 	recurrenceSchema,
 } from "./_shared.js";
+
+// Opt-in signature on the event description, default false. Reuses the same
+// SIGNATURE_HTML config as email. The note about marketing CTAs is deliberate:
+// the signature carries sales buttons that suit a client-facing invite but not
+// an internal one, so the flag is left to the caller per-event.
+const includeSignatureSchema = z.boolean().optional().default(false);
+const INCLUDE_SIGNATURE_DESC =
+	"Append the sender's configured signature to the event description, server-side. Set this flag rather than writing the signature into `description` yourself. Forces the description to HTML. No-op if no signature is configured. Note the signature includes marketing call-to-action buttons, which may not suit internal meetings. Default false.";
 
 // Common $select for events — kept here so list and instances stay in sync.
 // Note: `recurrence` is included so sanitizeEventList can flag `isRecurring`.
@@ -80,7 +89,7 @@ async function listCalendarEventsImpl(
 	return sanitizeEventList(data.value);
 }
 
-async function createCalendarEventImpl(
+export async function createCalendarEventImpl(
 	env: Env,
 	args: {
 		subject: string;
@@ -94,6 +103,7 @@ async function createCalendarEventImpl(
 		is_online_meeting?: boolean;
 		categories?: string[];
 		recurrence?: RecurrenceInput;
+		include_signature?: boolean;
 	},
 ): Promise<unknown> {
 	const timezone = args.timezone ?? "UTC";
@@ -111,9 +121,18 @@ async function createCalendarEventImpl(
 	};
 
 	if (args.location) event.location = { displayName: args.location };
-	if (args.description) {
+
+	// Signature path replaces the plain body build: like email, the signature is
+	// concatenated after sanitisation, so it cannot go through buildMessageBody.
+	const notes: string[] = [];
+	const signed = maybeSign(env, args.include_signature, args.description, args.body_type);
+	if (signed) {
+		event.body = { contentType: signed.contentType, content: signed.content };
+		notes.push(...signed.notes);
+	} else if (args.description) {
 		event.body = buildMessageBody(args.description, args.body_type);
 	}
+
 	if (attendeeList.length > 0) {
 		event.attendees = attendeeList.map((email) => ({
 			emailAddress: { address: email },
@@ -132,10 +151,16 @@ async function createCalendarEventImpl(
 	}
 
 	const data = await graphPost(env, "/me/events", event);
-	return { success: true, message: "Event created.", event: data };
+	const result: Record<string, unknown> = {
+		success: true,
+		message: "Event created.",
+		event: data,
+	};
+	if (notes.length > 0) result.notes = notes;
+	return result;
 }
 
-async function updateCalendarEventImpl(
+export async function updateCalendarEventImpl(
 	env: Env,
 	args: {
 		id: string;
@@ -148,10 +173,12 @@ async function updateCalendarEventImpl(
 		body_type?: string;
 		attendees?: string;
 		categories?: string[];
+		include_signature?: boolean;
 	},
 ): Promise<unknown> {
 	const timezone = args.timezone ?? "UTC";
 	const updates: Record<string, unknown> = {};
+	const notes: string[] = [];
 
 	if (args.subject) updates.subject = args.subject;
 	if (args.start_datetime)
@@ -159,7 +186,23 @@ async function updateCalendarEventImpl(
 	if (args.end_datetime)
 		updates.end = { dateTime: args.end_datetime, timeZone: timezone };
 	if (args.location) updates.location = { displayName: args.location };
-	if (args.description) {
+	// Sign only when a new description is supplied. This is a partial update, so
+	// signing with no description would build a signature-only body and replace
+	// the event's existing description.
+	const signBody = args.include_signature === true && !!args.description;
+	if (args.include_signature === true && !args.description) {
+		notes.push(
+			"include_signature was ignored: it only applies when you also provide a new description. " +
+				"The existing event description was left unchanged.",
+		);
+	}
+	if (signBody) {
+		const signed = maybeSign(env, true, args.description, args.body_type);
+		updates.body = signed
+			? { contentType: signed.contentType, content: signed.content }
+			: buildMessageBody(args.description!, args.body_type);
+		if (signed) notes.push(...signed.notes);
+	} else if (args.description) {
 		updates.body = buildMessageBody(args.description, args.body_type);
 	}
 	if (args.attendees) {
@@ -180,7 +223,9 @@ async function updateCalendarEventImpl(
 	}
 
 	await graphPatch(env, `/me/events/${args.id}`, updates);
-	return { success: true, message: "Event updated." };
+	const result: Record<string, unknown> = { success: true, message: "Event updated." };
+	if (notes.length > 0) result.notes = notes;
+	return result;
 }
 
 async function deleteCalendarEventImpl(
@@ -283,6 +328,7 @@ export const calendarTools = defineTools<Env>({
 			is_online_meeting: z.boolean().optional(),
 			categories: z.array(z.string().min(1).max(64)).max(32).optional(),
 			recurrence: recurrenceSchema.optional(),
+			include_signature: includeSignatureSchema.describe(INCLUDE_SIGNATURE_DESC),
 		}),
 		handler: (env, args) => createCalendarEventImpl(env, args),
 	},
@@ -301,6 +347,7 @@ export const calendarTools = defineTools<Env>({
 			body_type: z.enum(["text", "html"]).optional(),
 			attendees: z.string().max(4096).optional(),
 			categories: z.array(z.string().min(1).max(64)).max(32).optional(),
+			include_signature: includeSignatureSchema.describe(INCLUDE_SIGNATURE_DESC),
 		}),
 		handler: (env, args) => updateCalendarEventImpl(env, args),
 	},
