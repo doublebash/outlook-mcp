@@ -26,13 +26,18 @@ const DEFAULT_PROTOCOL_VERSION: (typeof SUPPORTED_PROTOCOL_VERSIONS)[number] =
 
 // OAuth client redirect URIs are allowed only under these hosts.
 //   - claude.ai / claude.com — Claude.ai's web/desktop OAuth client
-//   - 127.0.0.1 — loopback callback for native CLI clients (e.g. Hermes Agent)
+//   - 127.0.0.1 / localhost — loopback callback for native CLI clients
+//     (e.g. Hermes Agent, Claude Code desktop). Both spellings are needed:
+//     clients pick one or the other and this server previously accepted only
+//     the numeric form, so a client offering http://localhost:<port>/callback
+//     was rejected while every other server in the fleet accepted it.
 const ALLOWED_REDIRECT_HOSTS = new Set([
 	"claude.ai",
 	"api.claude.ai",
 	"claude.com",
 	"api.claude.com",
 	"127.0.0.1",
+	"localhost",
 ]);
 
 // 15 MB MCP body cap — generous enough to accept tool calls with 10 MB of
