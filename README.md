@@ -6,11 +6,11 @@ Fork this repo, deploy to your own Cloudflare account, register a Microsoft Azur
 
 Built on [`@bashco/mcp-toolkit`](https://github.com/doublebash/mcp-toolkit) — OAuth, per-client bearer tokens, rate limiting, structured logging, typed tool dispatch are all handled by the shared library.
 
-## What Claude gets — 38 tools across 7 domains
+## What Claude gets — 39 tools across 7 domains
 
 - **Mail**: list emails, read email, search, reply, forward, delete, send, move between folders, create draft, update draft, send draft, schedule send
 - **Calendar**: list events, list event occurrences, create, update, delete, cancel event, respond to event
-- **Contacts**: list, create contact
+- **Contacts**: list, create contact, update contact
 - **Tasks**: list task lists, list tasks, create task
 - **Files**: list files, share file
 - **Teams meetings**: list recent recordings (the discovery starting point — finds meetings that have content in the past N days, no inputs needed), find online meeting, list meeting recordings, list meeting transcripts, get transcript content. Each per-meeting tool accepts any of `meeting_id`, `calendar_event_id`, or `join_url` — so scheduled meetings (resolved via event), ad-hoc / Meet-now calls (resolved via join URL pasted from the Teams chat), and direct id lookups all work.
