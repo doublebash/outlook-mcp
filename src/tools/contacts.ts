@@ -11,7 +11,11 @@ async function listContactsImpl(
 ): Promise<unknown> {
 	const count = args.count ?? 20;
 	const query: Record<string, string | number> = {
-		$select: "id,displayName,emailAddresses,phones,companyName,jobTitle",
+		// Graph contacts have no generic `phones` property — phone numbers live in
+		// mobilePhone (string) plus businessPhones / homePhones (string arrays).
+		// Selecting `phones` 400s with a ParseUri error.
+		$select:
+			"id,displayName,givenName,surname,emailAddresses,mobilePhone,businessPhones,homePhones,companyName,jobTitle",
 		$top: count,
 		$orderby: "displayName",
 	};
@@ -48,7 +52,7 @@ async function createContactImpl(
 			},
 		];
 	}
-	if (args.phone) contact.phones = [{ number: args.phone, type: "mobile" }];
+	if (args.phone) contact.mobilePhone = args.phone;
 	if (args.company) contact.companyName = args.company;
 	if (args.job_title) contact.jobTitle = args.job_title;
 
