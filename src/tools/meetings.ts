@@ -332,7 +332,77 @@ function computeDurationMinutes(
 	return Math.round((endMs - startMs) / 60000);
 }
 
-async function listRecentMeetingRecordingsImpl(
+const DISCOVERY_PAGE_SIZE = 200;
+const DISCOVERY_MAX_PAGES = 10;
+const DISCOVERY_MAX_CANDIDATES = 200;
+
+// Collect Teams events in the window, newest first.
+//
+// `isOnlineMeeting` is not a filterable property — putting it in $filter makes
+// Graph reject the whole request with
+// `ErrorInvalidProperty: The property 'isOnlineMeeting' does not support
+// filtering`. So the date range is filtered server-side and the online-meeting
+// test happens here instead.
+//
+// That shifts what $top bounds: it now counts every event in the window rather
+// than only Teams ones, so a single page could be entirely all-day blocks and
+// 1:1s while real meetings sit just past the cut. Page through on $skiptoken
+// until there are enough candidates, capping pages so a long window on a busy
+// calendar can't run unbounded.
+async function fetchOnlineMeetingCandidates(
+	env: Env,
+	startIso: string,
+	endIso: string,
+): Promise<{ candidates: GraphEventForDiscovery[]; scanned: number }> {
+	// bodyPreview is selected so we can fall back to URL extraction when the
+	// structured Teams fields are empty (Outlook add-in quirk).
+	const baseQuery: Record<string, string | number> = {
+		$select:
+			"id,subject,start,end,isOnlineMeeting,onlineMeetingUrl,onlineMeeting,bodyPreview,organizer",
+		$top: DISCOVERY_PAGE_SIZE,
+		$filter: `start/dateTime ge '${startIso}' and start/dateTime le '${endIso}'`,
+		$orderby: "start/dateTime desc",
+	};
+
+	const candidates: GraphEventForDiscovery[] = [];
+	let query: Record<string, string | number> = baseQuery;
+	let scanned = 0;
+
+	for (let page = 0; page < DISCOVERY_MAX_PAGES; page++) {
+		const resp = (await graphGet(env, "/me/events", query)) as {
+			value?: GraphEventForDiscovery[];
+			"@odata.nextLink"?: string;
+		};
+
+		const events = resp.value ?? [];
+		scanned += events.length;
+		for (const event of events) {
+			if (event.isOnlineMeeting) candidates.push(event);
+		}
+
+		if (candidates.length >= DISCOVERY_MAX_CANDIDATES) break;
+
+		// Graph hands back an absolute nextLink; reuse just its $skiptoken so the
+		// request keeps going through the same query-building path.
+		const nextLink = resp["@odata.nextLink"];
+		if (!nextLink) break;
+		let skipToken: string | null = null;
+		try {
+			skipToken = new URL(nextLink).searchParams.get("$skiptoken");
+		} catch {
+			skipToken = null;
+		}
+		if (!skipToken) break;
+		query = { ...baseQuery, $skiptoken: skipToken };
+	}
+
+	return {
+		candidates: candidates.slice(0, DISCOVERY_MAX_CANDIDATES),
+		scanned,
+	};
+}
+
+export async function listRecentMeetingRecordingsImpl(
 	env: Env,
 	args: { within_days?: number; limit?: number },
 ): Promise<unknown> {
@@ -345,19 +415,11 @@ async function listRecentMeetingRecordingsImpl(
 	const startIso = new Date(now - withinDays * 86_400_000).toISOString();
 	const endIso = new Date(now + 86_400_000).toISOString();
 
-	// Server-side filter to online meetings only — cuts the working set
-	// dramatically vs. fetching every event and filtering client-side.
-	// bodyPreview is included so we can fall back to URL extraction when the
-	// structured Teams fields are empty (Outlook add-in quirk).
-	const eventsResp = (await graphGet(env, "/me/events", {
-		$select:
-			"id,subject,start,end,isOnlineMeeting,onlineMeetingUrl,onlineMeeting,bodyPreview,organizer",
-		$top: 200,
-		$filter: `start/dateTime ge '${startIso}' and start/dateTime le '${endIso}' and isOnlineMeeting eq true`,
-		$orderby: "start/dateTime desc",
-	})) as { value: GraphEventForDiscovery[] };
-
-	const events = eventsResp.value ?? [];
+	const { candidates: events, scanned } = await fetchOnlineMeetingCandidates(
+		env,
+		startIso,
+		endIso,
+	);
 
 	// Per-event work: resolve onlineMeeting id, fetch recordings + transcripts.
 	// One failed event must not abort the whole call — return null and filter.
@@ -433,14 +495,16 @@ async function listRecentMeetingRecordingsImpl(
 
 	auditLog("recent_meeting_recordings_listed", {
 		within_days: withinDays,
-		events_scanned: events.length,
+		events_scanned: scanned,
+		online_meetings: events.length,
 		with_content: withContent.length,
 		returned: top.length,
 	});
 
 	return {
 		within_days: withinDays,
-		events_scanned: events.length,
+		events_scanned: scanned,
+		online_meetings: events.length,
 		count: top.length,
 		recordings: top,
 	};
