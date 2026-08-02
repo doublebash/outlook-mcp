@@ -207,21 +207,37 @@ export function sanitizeEventList(items: unknown[]): unknown[] {
 interface RawContact {
   id?: string;
   displayName?: string;
+  givenName?: string;
+  surname?: string;
   emailAddresses?: Array<{ address?: string }>;
-  phones?: Array<{ number?: string; type?: string }>;
+  mobilePhone?: string | null;
+  businessPhones?: string[];
+  homePhones?: string[];
   companyName?: string;
   jobTitle?: string;
 }
 
 export function sanitizeContactList(items: unknown[]): unknown[] {
-  return (items as RawContact[]).map(item => ({
-    id: item.id,
-    name: item.displayName,
-    email: item.emailAddresses?.[0]?.address ?? null,
-    phone: item.phones?.[0]?.number ?? null,
-    company: item.companyName ?? null,
-    jobTitle: item.jobTitle ?? null,
-  }));
+  return (items as RawContact[]).map(item => {
+    const businessPhones = item.businessPhones ?? [];
+    const homePhones = item.homePhones ?? [];
+
+    return {
+      id: item.id,
+      name: item.displayName,
+      firstName: item.givenName ?? null,
+      lastName: item.surname ?? null,
+      email: item.emailAddresses?.[0]?.address ?? null,
+      // `phone` stays the single best-guess number so existing callers keep
+      // working; the specific fields below are additive.
+      phone: item.mobilePhone ?? businessPhones[0] ?? homePhones[0] ?? null,
+      mobile: item.mobilePhone ?? null,
+      businessPhones,
+      homePhones,
+      company: item.companyName ?? null,
+      jobTitle: item.jobTitle ?? null,
+    };
+  });
 }
 
 // ── Task list ──────────────────────────────────────────────────────────────────
