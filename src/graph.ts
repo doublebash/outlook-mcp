@@ -93,6 +93,58 @@ export async function graphGet(
 	});
 }
 
+// ── Paging ────────────────────────────────────────────────────────────────────
+// Graph advertises the next page as an absolute `@odata.nextLink`. Microsoft's
+// paging guidance is explicit that the whole URL has to be reused as-is:
+//
+//   "Depending on the API that the query is being performed against, the
+//    @odata.nextLink URL value contains either a $skiptoken or a $skip query
+//    parameter. Any other query parameters that were present in the original
+//    request are also encoded in this URL. Don't try to extract the $skiptoken
+//    or $skip value and use it in a different request."
+//
+// Pulling one named token out of the link and rebuilding the query looks like it
+// works — until it meets an endpoint that pages with the other form, where the
+// lookup returns null and paging silently stops after page one. /me/events is
+// one such endpoint. Silent truncation is worse than an error, so we follow the
+// link instead of second-guessing it.
+//
+// The link still gets validated before it's followed: it arrives inside a
+// response body, and a bearer token must never be sent to a host we didn't mean
+// to call.
+export function resolveNextLinkPath(nextLink: string): string {
+	let url: URL;
+	try {
+		url = new URL(nextLink);
+	} catch {
+		throw new ToolError({
+			userMessage: "Outlook returned a malformed pagination link.",
+			internalMessage: `Unparseable @odata.nextLink: ${nextLink}`,
+			upstreamName: "Graph",
+		});
+	}
+
+	const base = new URL(GRAPH_BASE);
+	const withinBase =
+		url.origin === base.origin &&
+		(url.pathname === base.pathname || url.pathname.startsWith(`${base.pathname}/`));
+	if (!withinBase) {
+		throw new ToolError({
+			userMessage: "Outlook returned a pagination link pointing somewhere unexpected.",
+			internalMessage: `@odata.nextLink outside ${GRAPH_BASE}: ${url.origin}${url.pathname}`,
+			upstreamName: "Graph",
+		});
+	}
+
+	// The upstream client concatenates baseUrl + path, so hand back everything
+	// after the base — query string included, untouched.
+	return `${url.pathname.slice(base.pathname.length)}${url.search}`;
+}
+
+export async function graphGetNextLink(env: Env, nextLink: string): Promise<unknown> {
+	return graphFetch(env, { method: "GET", path: resolveNextLinkPath(nextLink) });
+}
+
 export async function graphPost(env: Env, path: string, body?: unknown): Promise<unknown> {
 	return graphFetch(env, {
 		method: "POST",

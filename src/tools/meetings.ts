@@ -1,6 +1,6 @@
 import { ToolError, defineTools } from "@bashco/mcp-toolkit";
 import { z } from "zod";
-import { graphGet, graphRequestRaw } from "../graph.js";
+import { graphGet, graphGetNextLink, graphRequestRaw } from "../graph.js";
 import { parseVtt } from "../transcript-helpers.js";
 import type { Env } from "../types.js";
 import { auditLog, escapeOdataString } from "./_shared.js";
@@ -346,9 +346,9 @@ const DISCOVERY_MAX_CANDIDATES = 200;
 //
 // That shifts what $top bounds: it now counts every event in the window rather
 // than only Teams ones, so a single page could be entirely all-day blocks and
-// 1:1s while real meetings sit just past the cut. Page through on $skiptoken
-// until there are enough candidates, capping pages so a long window on a busy
-// calendar can't run unbounded.
+// 1:1s while real meetings sit just past the cut. Page through Graph's
+// @odata.nextLink until there are enough candidates, capping pages so a long
+// window on a busy calendar can't run unbounded.
 async function fetchOnlineMeetingCandidates(
 	env: Env,
 	startIso: string,
@@ -365,11 +365,15 @@ async function fetchOnlineMeetingCandidates(
 	};
 
 	const candidates: GraphEventForDiscovery[] = [];
-	let query: Record<string, string | number> = baseQuery;
+	let nextLink: string | undefined;
 	let scanned = 0;
 
 	for (let page = 0; page < DISCOVERY_MAX_PAGES; page++) {
-		const resp = (await graphGet(env, "/me/events", query)) as {
+		// First page is built here; every page after it is whatever Graph handed
+		// back, followed verbatim — see resolveNextLinkPath() for why.
+		const resp = (await (nextLink === undefined
+			? graphGet(env, "/me/events", baseQuery)
+			: graphGetNextLink(env, nextLink))) as {
 			value?: GraphEventForDiscovery[];
 			"@odata.nextLink"?: string;
 		};
@@ -382,18 +386,8 @@ async function fetchOnlineMeetingCandidates(
 
 		if (candidates.length >= DISCOVERY_MAX_CANDIDATES) break;
 
-		// Graph hands back an absolute nextLink; reuse just its $skiptoken so the
-		// request keeps going through the same query-building path.
-		const nextLink = resp["@odata.nextLink"];
+		nextLink = resp["@odata.nextLink"];
 		if (!nextLink) break;
-		let skipToken: string | null = null;
-		try {
-			skipToken = new URL(nextLink).searchParams.get("$skiptoken");
-		} catch {
-			skipToken = null;
-		}
-		if (!skipToken) break;
-		query = { ...baseQuery, $skiptoken: skipToken };
 	}
 
 	return {

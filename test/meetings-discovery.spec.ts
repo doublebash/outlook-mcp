@@ -5,6 +5,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // Graph on every call, which only showed up against a live tenant.
 vi.mock("../src/graph.js", () => ({
 	graphGet: vi.fn(),
+	graphGetNextLink: vi.fn(),
 	graphPost: vi.fn(),
 	graphPatch: vi.fn(),
 	graphDelete: vi.fn(),
@@ -12,7 +13,7 @@ vi.mock("../src/graph.js", () => ({
 	graphPutBinary: vi.fn(),
 }));
 
-import { graphGet } from "../src/graph.js";
+import { graphGet, graphGetNextLink } from "../src/graph.js";
 import { listRecentMeetingRecordingsImpl } from "../src/tools/meetings.js";
 
 const env = {} as never;
@@ -40,16 +41,23 @@ function plainEvent(id: string) {
 	};
 }
 
-// Routes the three call shapes the impl makes: the events page, the
-// onlineMeetings JoinWebUrl lookup, then recordings/transcripts per meeting.
+// Routes the call shapes the impl makes: the first events page (graphGet), each
+// subsequent page (graphGetNextLink), the onlineMeetings JoinWebUrl lookup, then
+// recordings/transcripts per meeting.
+//
+// Pages after the first deliberately arrive through a different function now —
+// the impl follows Graph's nextLink URL rather than rebuilding the query, so the
+// two paths are worth keeping visibly distinct in the harness.
 function routeGraph(
 	eventPages: Array<{ value: unknown[]; "@odata.nextLink"?: string }>,
 	opts: { withContent?: boolean } = {},
 ) {
 	let page = 0;
+	const nextPage = () => eventPages[page++] ?? { value: [] };
+
 	vi.mocked(graphGet).mockImplementation(
 		async (_e: unknown, path: string): Promise<unknown> => {
-			if (path === "/me/events") return eventPages[page++] ?? { value: [] };
+			if (path === "/me/events") return nextPage();
 			if (path === "/me/onlineMeetings") return { value: [{ id: "om-1" }] };
 			if (path.endsWith("/recordings")) {
 				return {
@@ -68,6 +76,8 @@ function routeGraph(
 			return { value: [] };
 		},
 	);
+
+	vi.mocked(graphGetNextLink).mockImplementation(async (): Promise<unknown> => nextPage());
 }
 
 function eventsQueries(): Array<Record<string, string | number>> {
@@ -75,6 +85,16 @@ function eventsQueries(): Array<Record<string, string | number>> {
 		.mocked(graphGet)
 		.mock.calls.filter(c => c[1] === "/me/events")
 		.map(c => c[2] as Record<string, string | number>);
+}
+
+// The exact nextLink URLs handed to the follower, in order.
+function nextLinksFollowed(): string[] {
+	return vi.mocked(graphGetNextLink).mock.calls.map(c => c[1] as string);
+}
+
+// Total requests for a page of events, however they were routed.
+function eventPageRequests(): number {
+	return eventsQueries().length + nextLinksFollowed().length;
 }
 
 beforeEach(() => {
@@ -155,28 +175,63 @@ describe("list_recent_meeting_recordings — paging", () => {
 			count: number;
 		};
 
-		const queries = eventsQueries();
-		expect(queries).toHaveLength(2);
-		expect(queries[1]?.$skiptoken).toBe("PAGE2");
+		expect(eventsQueries()).toHaveLength(1);
+		expect(nextLinksFollowed()).toEqual([
+			"https://graph.microsoft.com/v1.0/me/events?$skiptoken=PAGE2",
+		]);
 		expect(result.events_scanned).toBe(3);
 		expect(result.count).toBe(1);
 	});
 
-	it("carries the filter and select onto later pages", async () => {
+	// Regression guard. Graph pages Outlook collections with `$skip` on some
+	// endpoints and `$skiptoken` on others, and its docs say not to pick either
+	// value out and reuse it. An earlier version read `$skiptoken` and bailed when
+	// it was absent, which turned a `$skip` nextLink into a silent one-page result
+	// — no error, just missing meetings.
+	it("pages on a nextLink that uses $skip rather than $skiptoken", async () => {
+		routeGraph(
+			[
+				{
+					value: [plainEvent("p1")],
+					"@odata.nextLink":
+						"https://graph.microsoft.com/v1.0/me/events?$top=200&$skip=200",
+				},
+				{ value: [teamsEvent("t1")] },
+			],
+			{ withContent: true },
+		);
+
+		const result = (await listRecentMeetingRecordingsImpl(env, {})) as {
+			events_scanned: number;
+			online_meetings: number;
+			count: number;
+		};
+
+		expect(nextLinksFollowed()).toEqual([
+			"https://graph.microsoft.com/v1.0/me/events?$top=200&$skip=200",
+		]);
+		expect(result.events_scanned).toBe(2);
+		expect(result.online_meetings).toBe(1);
+		expect(result.count).toBe(1);
+	});
+
+	// Graph re-encodes the original request's parameters into the nextLink, so
+	// the link is the whole request — it must go back untouched rather than being
+	// taken apart and reassembled.
+	it("follows the nextLink verbatim instead of rebuilding the query", async () => {
+		const link =
+			"https://graph.microsoft.com/v1.0/me/events" +
+			"?$select=id%2Csubject&$top=200&$orderby=start%2FdateTime%20desc&$skiptoken=OPAQUE%3D%3D";
 		routeGraph([
-			{
-				value: [plainEvent("p1")],
-				"@odata.nextLink":
-					"https://graph.microsoft.com/v1.0/me/events?$skiptoken=PAGE2",
-			},
+			{ value: [plainEvent("p1")], "@odata.nextLink": link },
 			{ value: [] },
 		]);
 
 		await listRecentMeetingRecordingsImpl(env, {});
 
-		const [first, second] = eventsQueries();
-		expect(second?.$filter).toBe(first?.$filter);
-		expect(second?.$select).toBe(first?.$select);
+		expect(nextLinksFollowed()).toEqual([link]);
+		// The follow-up must not go back through the query-building path.
+		expect(eventsQueries()).toHaveLength(1);
 	});
 
 	it("stops when Graph returns no nextLink", async () => {
@@ -184,40 +239,24 @@ describe("list_recent_meeting_recordings — paging", () => {
 
 		await listRecentMeetingRecordingsImpl(env, {});
 
-		expect(eventsQueries()).toHaveLength(1);
-	});
-
-	it("stops rather than looping when a nextLink carries no skiptoken", async () => {
-		routeGraph([
-			{
-				value: [plainEvent("p1")],
-				"@odata.nextLink": "https://graph.microsoft.com/v1.0/me/events",
-			},
-			{ value: [teamsEvent("t1")] },
-		]);
-
-		await listRecentMeetingRecordingsImpl(env, {});
-
-		expect(eventsQueries()).toHaveLength(1);
+		expect(eventPageRequests()).toBe(1);
+		expect(nextLinksFollowed()).toEqual([]);
 	});
 
 	it("caps paging so a long window cannot run unbounded", async () => {
 		// Every page is non-Teams and always advertises another page.
+		const endlessPage = {
+			value: [plainEvent("p")],
+			"@odata.nextLink": "https://graph.microsoft.com/v1.0/me/events?$skiptoken=MORE",
+		};
 		vi.mocked(graphGet).mockImplementation(
-			async (_e: unknown, path: string): Promise<unknown> => {
-				if (path === "/me/events") {
-					return {
-						value: [plainEvent("p")],
-						"@odata.nextLink":
-							"https://graph.microsoft.com/v1.0/me/events?$skiptoken=MORE",
-					};
-				}
-				return { value: [] };
-			},
+			async (_e: unknown, path: string): Promise<unknown> =>
+				path === "/me/events" ? endlessPage : { value: [] },
 		);
+		vi.mocked(graphGetNextLink).mockImplementation(async (): Promise<unknown> => endlessPage);
 
 		await listRecentMeetingRecordingsImpl(env, { within_days: 90 });
 
-		expect(eventsQueries().length).toBeLessThanOrEqual(10);
+		expect(eventPageRequests()).toBeLessThanOrEqual(10);
 	});
 });
