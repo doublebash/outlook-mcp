@@ -120,13 +120,31 @@ export function bodyContainsSignature(body: string, signature: string): boolean 
 /**
  * Outlook marks where new content ends and the quoted original begins.
  * `appendonsend` is Microsoft's own canonical marker; `divRplyFwdMsg` is the
- * older/Outlook-desktop form. Checked in that order.
+ * older/Outlook-desktop form; `stopSpelling` is the desktop divider rule.
+ *
+ * Which of these Graph emits varies by the format of the message being replied
+ * to, and they do NOT appear in a fixed order relative to each other — so these
+ * are scanned for the EARLIEST match in the document, never in list order. See
+ * findQuoteBoundary.
  */
 const QUOTE_BOUNDARIES = [
 	/<div\b[^>]*\bid\s*=\s*["']?appendonsend["']?[^>]*>/i,
 	/<div\b[^>]*\bid\s*=\s*["']?divRplyFwdMsg["']?[^>]*>/i,
 	/<hr\b[^>]*\bid\s*=\s*["']?stopSpelling["']?[^>]*>/i,
 ];
+
+/**
+ * A horizontal rule immediately preceding the quote header — Outlook's visible
+ * divider between new content and the quoted original. OWA's form carries no
+ * `id` (`<hr style="display:inline-block;width:98%" tabindex="-1">`), so it
+ * cannot be matched by id like `stopSpelling` can.
+ *
+ * Anchored to the END of the string on purpose: it is only applied to the slice
+ * that sits directly above an already-located boundary. Matching a bare <hr>
+ * anywhere in the document would also hit rules inside the quoted original's
+ * own content and splice the reply into the middle of the quote.
+ */
+const TRAILING_DIVIDER = /<hr\b[^>]*>\s*$/i;
 
 /**
  * Breathing room between inserted content and the quoted original below it.
@@ -142,13 +160,30 @@ const QUOTE_SPACER = "<br><br>";
 /**
  * Index at which the quoted original begins, or null when this body carries no
  * recognisable quote block.
+ *
+ * Takes the EARLIEST match across all boundary patterns rather than the first
+ * pattern that happens to hit. Returning the first *pattern* match instead put
+ * the reply below Outlook's divider whenever the markers appeared in an order
+ * other than the list's: a desktop-format quote leads with
+ * `<hr id="stopSpelling">` and only then `divRplyFwdMsg`, so checking
+ * divRplyFwdMsg first skipped straight past the rule.
+ *
+ * The result is then backed up over the divider rule itself, so the divider
+ * stays BELOW the new content and signature — it separates the reply from the
+ * quote, and reads as a cut-off message when it sits above them.
  */
 export function findQuoteBoundary(html: string): number | null {
+	let earliest: number | null = null;
 	for (const boundary of QUOTE_BOUNDARIES) {
 		const match = boundary.exec(html);
-		if (match) return match.index;
+		if (match && (earliest === null || match.index < earliest)) earliest = match.index;
 	}
-	return null;
+	if (earliest === null) return null;
+
+	// OWA's divider carries no id, so it is not in QUOTE_BOUNDARIES. Locate it
+	// by position instead: a rule directly above the quote header IS the divider.
+	const divider = TRAILING_DIVIDER.exec(html.slice(0, earliest));
+	return divider ? divider.index : earliest;
 }
 
 /**

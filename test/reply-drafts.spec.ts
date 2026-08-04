@@ -77,12 +77,16 @@ describe("quoted original is preserved", () => {
 		'<div id="divRplyFwdMsg">From: adam@example.com<br>Sent: Monday<br>Subject: Quarterly numbers</div><div>Original message text.</div>';
 	const GENERATED = `<html><body><div></div><div id="appendonsend"></div><hr>${QUOTE}</body></html>`;
 
-	function withGeneratedBody() {
+	// Graph omits appendonsend depending on the format of the message being
+	// replied to, leaving only the divider rule above the quote header.
+	const GENERATED_NO_APPENDONSEND = `<html><body><div></div><hr style="display:inline-block;width:98%" tabindex="-1">${QUOTE}</body></html>`;
+
+	function withGeneratedBody(content: string = GENERATED) {
 		const base = vi.mocked(graphGet).getMockImplementation()!;
 		vi.mocked(graphGet).mockImplementation(async (e: unknown, path: string, q?: unknown) => {
 			const query = q as { $select?: string } | undefined;
 			if (path === `/me/messages/${DRAFT_ID}` && query?.$select === "body") {
-				return { body: { contentType: "HTML", content: GENERATED } };
+				return { body: { contentType: "HTML", content } };
 			}
 			return base(e, path, q);
 		});
@@ -109,6 +113,17 @@ describe("quoted original is preserved", () => {
 
 		const content = patchedBody();
 		expect(content.indexOf("Thanks, noted.")).toBeLessThan(content.indexOf("divRplyFwdMsg"));
+	});
+
+	// Regression: with no appendonsend to anchor to, the reply landed below
+	// Outlook's divider, so the draft opened with a rule across the top.
+	it("places the reply above the divider when appendonsend is absent", async () => {
+		withGeneratedBody(GENERATED_NO_APPENDONSEND);
+		await createReplyDraftImpl(env, { id: ORIG_OTHER, body: "Thanks, noted." });
+
+		const content = patchedBody();
+		expect(content.indexOf("Thanks, noted.")).toBeLessThan(content.search(/<hr\b/i));
+		expect(content).toContain("Original message text.");
 	});
 
 	it("keeps the quoted original when forwarding with a comment", async () => {

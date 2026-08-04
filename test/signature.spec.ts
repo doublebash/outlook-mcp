@@ -178,6 +178,41 @@ describe("insertAboveQuote — reply/forward placement", () => {
 		expect(out).toContain("From: someone@example.com");
 	});
 
+	// Regression: the divider belongs BELOW the reply and signature, separating
+	// them from the quote. Landing beneath it made every reply open with a stray
+	// rule across the top, which reads as a truncated message.
+	describe("Outlook's divider stays below the new content", () => {
+		// OWA's rule carries no id, so it cannot be matched the way stopSpelling is.
+		const OWA_HR = '<hr style="display:inline-block;width:98%" tabindex="-1">';
+
+		it("inserts above a bare OWA divider when appendonsend is absent", () => {
+			const out = insertAboveQuote(`<div>Draft area</div>${OWA_HR}${QUOTED}`, SIG);
+			expect(out.indexOf("Test Sender")).toBeLessThan(out.search(/<hr\b/i));
+		});
+
+		it("inserts above a desktop stopSpelling divider", () => {
+			const body = `<div>Draft area</div><hr id="stopSpelling">${QUOTED}`;
+			const out = insertAboveQuote(body, SIG);
+			expect(out.indexOf("Test Sender")).toBeLessThan(out.search(/<hr\b/i));
+		});
+
+		it("still inserts above appendonsend when it precedes the divider", () => {
+			const body = `<div>Draft area</div><div id="appendonsend"></div>${OWA_HR}${QUOTED}`;
+			const out = insertAboveQuote(body, SIG);
+			expect(out.indexOf("Test Sender")).toBeLessThan(out.indexOf("appendonsend"));
+			expect(out.indexOf("Test Sender")).toBeLessThan(out.search(/<hr\b/i));
+		});
+
+		// A rule inside the quoted original is not the divider. Matching a bare
+		// <hr> anywhere would splice the reply into the middle of the quote.
+		it("ignores a rule that sits inside the quoted original", () => {
+			const body = `<div>Draft area</div>${QUOTED}<hr><div>More quoted text.</div>`;
+			const out = insertAboveQuote(body, SIG);
+			expect(out.indexOf("Test Sender")).toBeLessThan(out.indexOf("divRplyFwdMsg"));
+			expect(out).toContain("More quoted text.");
+		});
+	});
+
 	// Without a spacer the signature butts straight up against Outlook's <hr>
 	// and "From:" header, which reads as the signature having been cut off.
 	it("leaves a gap between the signature and the quote", () => {
