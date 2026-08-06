@@ -40,6 +40,43 @@ type GraphInit = {
 	headers?: Record<string, string>;
 };
 
+// ── Query strings ─────────────────────────────────────────────────────────────
+// The toolkit's upstream client builds query strings with URLSearchParams, which
+// percent-encodes `$` to `%24` — it only leaves ASCII alphanumerics and `*-._`
+// alone. Graph's Outlook/Exchange backends (/me/messages, /me/events,
+// /me/contacts, /me/drive) decode that and carry on, so `%24select` went
+// unnoticed for as long as those were the only endpoints we called.
+//
+// Microsoft To Do does not. `/me/todo/*` is fronted by a request broker that
+// never decodes the parameter *name*, so it fails to parse the URI and answers
+// `400 invalidRequest` with `innerError.code` of `RequestBroker--ParseUri` — a
+// generic error that names neither the parameter nor the property. Any To Do
+// call carrying a query string died on it; the ones without a query string
+// (resolving the default list, POSTing a new task) were unaffected.
+//
+// So the query string is built here, with OData option names left literal the
+// way Microsoft's own documentation writes them. Values are still percent-
+// encoded, minus the two characters OData syntax needs to stay readable and
+// which are legal unencoded in a query string per RFC 3986: `,` separating
+// $select fields and $filter function arguments, and `/` in nested property
+// paths like `start/dateTime`.
+function encodeGraphValue(value: string): string {
+	return encodeURIComponent(value).replace(/%2C/g, ",").replace(/%2F/g, "/");
+}
+
+export function buildGraphPath(
+	path: string,
+	query?: Record<string, string | number | undefined>,
+): string {
+	if (!query) return path;
+	const parts: string[] = [];
+	for (const [key, value] of Object.entries(query)) {
+		if (value === undefined || value === null || value === "") continue;
+		parts.push(`${key}=${encodeGraphValue(String(value))}`);
+	}
+	return parts.length > 0 ? `${path}?${parts.join("&")}` : path;
+}
+
 async function graphFetch(env: Env, init: GraphInit): Promise<unknown> {
 	const token = await getValidAccessToken(env);
 	const client = createUpstreamClient({
@@ -53,9 +90,10 @@ async function graphFetch(env: Env, init: GraphInit): Promise<unknown> {
 
 	try {
 		return await client.fetch({
+			// Query folded into the path so it keeps this module's encoding — handing
+			// `query` to the client would put it back through URLSearchParams.
 			method: init.method,
-			path: init.path,
-			...(init.query !== undefined ? { query: init.query } : {}),
+			path: buildGraphPath(init.path, init.query),
 			...(init.body !== undefined ? { body: init.body } : {}),
 			...(init.headers !== undefined ? { headers: init.headers } : {}),
 		});
