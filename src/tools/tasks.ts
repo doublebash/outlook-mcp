@@ -1,31 +1,85 @@
 import { defineTools } from "@bashco/mcp-toolkit";
 import { z } from "zod";
-import { graphGet, graphPost } from "../graph.js";
+import { graphGet, graphGetNextLink, graphPost } from "../graph.js";
 import { sanitizeTaskList, sanitizeTaskLists } from "../sanitize.js";
 import type { Env } from "../types.js";
 
 const taskListIdSchema = z.string().min(1).max(512);
 
-async function listTaskListsImpl(env: Env): Promise<unknown> {
-	const data = (await graphGet(env, "/me/todo/lists", {
-		$select: "id,displayName,isOwner,isShared,wellknownListName",
-	})) as { value: unknown[] };
-	return sanitizeTaskLists(data.value);
+// ── Why these calls carry no query string ─────────────────────────────────────
+// Microsoft To Do is the one Graph workload here that refuses OData query
+// options on its collection endpoints. `/me/todo/lists?$select=...` answers
+// `400 invalidRequest` with an `innerError.code` of `RequestBroker--ParseUri`
+// and a message of just "Invalid request" — it names neither the option nor a
+// property, so it reads like a malformed URL rather than an unsupported feature.
+//
+// It is neither. Every property these tools used to select is real and spelled
+// as the todoTaskList and todoTask resources document it, and the rejection
+// survives sending `$select` literally instead of percent-encoded as `%24select`
+// (the encoding Graph's Outlook backends accept for mail, calendar, contacts and
+// files). The To Do backend just doesn't implement the option; Microsoft's own
+// reference hedges with "supports some of the OData query parameters" and
+// declines to say which.
+//
+// That took out both read paths from the day they were written. create_task
+// escaped it by accident: resolving the default list is a bare GET and the
+// create itself is a POST, so neither carries a query string — which is exactly
+// the shape proven to work, and the shape everything below now uses.
+//
+// The sanitisers already project down to the fields we return, so dropping
+// $select costs response size and nothing else. Status filtering moves into JS.
+
+// Graph pages To Do collections with `@odata.nextLink`. Without a server-side
+// `$filter` the completed tasks now take up page slots, so an open task can sit
+// behind a page boundary — follow the link rather than truncating at page one.
+const MAX_PAGES = 10;
+
+interface GraphPage {
+	value?: unknown[];
+	"@odata.nextLink"?: string;
+}
+
+async function collectPages(env: Env, path: string): Promise<unknown[]> {
+	let page = (await graphGet(env, path)) as GraphPage;
+	const items: unknown[] = [...(page.value ?? [])];
+
+	for (let fetched = 1; fetched < MAX_PAGES; fetched += 1) {
+		const next = page["@odata.nextLink"];
+		if (!next) break;
+		page = (await graphGetNextLink(env, next)) as GraphPage;
+		items.push(...(page.value ?? []));
+	}
+
+	return items;
+}
+
+export async function listTaskListsImpl(env: Env): Promise<unknown> {
+	return sanitizeTaskLists(await collectPages(env, "/me/todo/lists"));
 }
 
 async function resolveTaskListId(env: Env, listId: string | undefined): Promise<string> {
 	if (listId) return listId;
-	const data = (await graphGet(env, "/me/todo/lists")) as {
-		value: Array<{ id: string; wellknownListName?: string }>;
-	};
-	const def = data.value.find((l) => l.wellknownListName === "defaultList");
-	const fallback = data.value[0];
+	const lists = (await collectPages(env, "/me/todo/lists")) as Array<{
+		id: string;
+		wellknownListName?: string;
+	}>;
+	const def = lists.find((l) => l.wellknownListName === "defaultList");
+	const fallback = lists[0];
 	if (def) return def.id;
 	if (fallback) return fallback.id;
 	throw new Error("No To Do lists found on this account.");
 }
 
-async function listTasksImpl(
+// Graph's taskStatus enum also carries `waitingOnOthers` and `deferred`, which
+// the tool's own enum doesn't offer. Both are open work, so the default view
+// keeps them by excluding only `completed` rather than listing what to include.
+export function selectTasksByStatus(tasks: unknown[], status: string | undefined): unknown[] {
+	return (tasks as Array<{ status?: string }>).filter((task) =>
+		status ? task.status === status : task.status !== "completed",
+	);
+}
+
+export async function listTasksImpl(
 	env: Env,
 	args: {
 		list_id?: string;
@@ -33,23 +87,11 @@ async function listTasksImpl(
 	},
 ): Promise<unknown> {
 	const listId = await resolveTaskListId(env, args.list_id);
-	const query: Record<string, string | number> = {
-		$select: "id,title,status,importance,dueDateTime,body,createdDateTime",
-	};
-	if (args.status) {
-		query.$filter = `status eq '${args.status}'`;
-	} else {
-		query.$filter = "status ne 'completed'";
-	}
-	const data = (await graphGet(
-		env,
-		`/me/todo/lists/${listId}/tasks`,
-		query,
-	)) as { value: unknown[] };
-	return sanitizeTaskList(data.value);
+	const tasks = await collectPages(env, `/me/todo/lists/${listId}/tasks`);
+	return sanitizeTaskList(selectTasksByStatus(tasks, args.status));
 }
 
-async function createTaskImpl(
+export async function createTaskImpl(
 	env: Env,
 	args: {
 		title: string;
