@@ -810,7 +810,52 @@ async function scheduleSendImpl(
 	);
 }
 
-async function getConversationImpl(
+// ── Conversation lookup ───────────────────────────────────────────────────────
+
+const CONVERSATION_DEFAULT_COUNT = 50;
+const CONVERSATION_MAX_COUNT = 200;
+const CONVERSATION_SELECT =
+	"id,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,body,hasAttachments,isDraft";
+
+interface ConversationMessage {
+	receivedDateTime?: string;
+}
+
+// Oldest first, in the Worker rather than in Graph — see getConversationImpl for
+// why the server-side sort had to go. `Array#sort` is stable (ES2019+), so
+// messages sharing a timestamp keep the order Graph returned them in, and
+// messages with no parseable `receivedDateTime` (Graph can omit it on drafts)
+// fall to the end instead of scattering through the thread.
+function sortByReceivedAsc<T extends ConversationMessage>(messages: T[]): T[] {
+	return [...messages].sort((a, b) => {
+		const ta = Date.parse(a.receivedDateTime ?? "");
+		const tb = Date.parse(b.receivedDateTime ?? "");
+		if (Number.isNaN(ta)) return Number.isNaN(tb) ? 0 : 1;
+		if (Number.isNaN(tb)) return -1;
+		return ta - tb;
+	});
+}
+
+// Both inputs are supported: a message_id is resolved to its thread first.
+async function resolveConversationIdFromMessage(env: Env, messageId: string): Promise<string> {
+	let msg: { conversationId?: string } | null;
+	try {
+		msg = (await graphGet(env, `/me/messages/${messageId}`, {
+			$select: "conversationId",
+		})) as { conversationId?: string } | null;
+	} catch (e) {
+		// Otherwise this surfaces as "Outlook error 404: ErrorItemNotFound: ..."
+		// — technically true, but it doesn't say which lookup failed.
+		if (e instanceof ToolError && e.status === 404) {
+			throw ToolError.notFound("Message", messageId);
+		}
+		throw e;
+	}
+	if (!msg?.conversationId) throw ToolError.notFound("Message", messageId);
+	return msg.conversationId;
+}
+
+export async function getConversationImpl(
 	env: Env,
 	args: { conversation_id?: string; message_id?: string; count?: number },
 ): Promise<unknown> {
@@ -819,35 +864,43 @@ async function getConversationImpl(
 		if (!args.message_id) {
 			throw ToolError.validation("Either conversation_id or message_id is required");
 		}
-		const msg = (await graphGet(env, `/me/messages/${args.message_id}`, {
-			$select: "conversationId",
-		})) as { conversationId?: string };
-		if (!msg.conversationId)
-			throw ToolError.validation("Could not resolve conversationId from message");
-		conversationId = msg.conversationId;
+		conversationId = await resolveConversationIdFromMessage(env, args.message_id);
 	}
 
-	const count = args.count ?? 50;
+	// Clamp defensively: the schema already bounds `count`, but this function is
+	// called directly from tests and keeping the Graph page bounded is the whole
+	// reason the request stays cheap enough to sort locally.
+	const count = Math.min(
+		Math.max(args.count ?? CONVERSATION_DEFAULT_COUNT, 1),
+		CONVERSATION_MAX_COUNT,
+	);
 	const safeId = escapeOdataString(conversationId);
-	// `ConsistencyLevel: eventual` enables server-side $orderby combined with
-	// $filter — the advanced-query opt-in Microsoft Graph requires.
-	const data = (await graphGet(
-		env,
-		"/me/messages",
-		{
-			$filter: `conversationId eq '${safeId}'`,
-			$select:
-				"id,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,body,hasAttachments,isDraft",
-			$top: count,
-			$orderby: "receivedDateTime asc",
-		},
-		{ ConsistencyLevel: "eventual" },
-	)) as { value: unknown[] };
+
+	// Filter only — no `$orderby`, no `ConsistencyLevel: eventual`. Pairing a
+	// conversationId restriction with a server-side date sort makes Graph reject
+	// the whole request:
+	//
+	//   400 InefficientFilter: The restriction or sort order is too complex for
+	//   this operation.
+	//
+	// A mailbox has no index that serves both at once, and the advanced-query
+	// opt-in that unlocks filter+orderby on directory endpoints does not apply to
+	// /me/messages. A bare conversationId filter is supported and cross-folder
+	// (Graph searches the whole mailbox — inbox, sent, archive), so the shape of
+	// the result is unchanged; only the ordering moves into the Worker below.
+	const data = (await graphGet(env, "/me/messages", {
+		$filter: `conversationId eq '${safeId}'`,
+		$select: CONVERSATION_SELECT,
+		$top: count,
+	})) as { value?: ConversationMessage[] } | null;
+
+	const messages = Array.isArray(data?.value) ? data.value : [];
+	if (messages.length === 0) throw ToolError.notFound("Conversation", conversationId);
 
 	return {
 		conversationId,
-		count: data.value.length,
-		messages: data.value.map((m) => sanitizeEmailFull(m)),
+		count: messages.length,
+		messages: sortByReceivedAsc(messages).map((m) => sanitizeEmailFull(m)),
 	};
 }
 
