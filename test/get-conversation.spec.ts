@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // get_conversation sends, without standing up a live Microsoft Graph session.
 vi.mock("../src/graph.js", () => ({
 	graphGet: vi.fn(),
+	graphGetNextLink: vi.fn(),
 	graphPost: vi.fn(),
 	graphPatch: vi.fn(),
 	graphDelete: vi.fn(),
@@ -14,7 +15,7 @@ vi.mock("../src/graph.js", () => ({
 	graphPutBinary: vi.fn(),
 }));
 
-import { graphGet } from "../src/graph.js";
+import { graphGet, graphGetNextLink } from "../src/graph.js";
 import { getConversationImpl } from "../src/tools/email.js";
 
 const env = {} as never;
@@ -176,24 +177,152 @@ describe("Graph request shape", () => {
 		expect(call?.[3]).toBeUndefined();
 	});
 
-	it("bounds the page with $top", async () => {
+	// Page size is the second InefficientFilter trigger: Graph's cost estimate
+	// scales with $top, so the request stays small and pages instead.
+	it("asks for a small page rather than the whole count", async () => {
 		await getConversationImpl(env, { conversation_id: CONV_ID });
-		expect(messagesQuery().$top).toBe(50);
+		expect(messagesQuery().$top).toBe(10);
+	});
 
-		vi.clearAllMocks();
-		vi.mocked(graphGet).mockResolvedValue({ value: THREAD });
+	it("never asks for more than the caller wants", async () => {
 		await getConversationImpl(env, { conversation_id: CONV_ID, count: 5 });
 		expect(messagesQuery().$top).toBe(5);
-
-		vi.clearAllMocks();
-		vi.mocked(graphGet).mockResolvedValue({ value: THREAD });
-		await getConversationImpl(env, { conversation_id: CONV_ID, count: 5000 });
-		expect(messagesQuery().$top).toBe(200);
 	});
 
 	it("escapes single quotes in the conversation id", async () => {
 		await getConversationImpl(env, { conversation_id: "a'b" });
 		expect(messagesQuery().$filter).toBe("conversationId eq 'a''b'");
+	});
+});
+
+// The exact failure Sal's inbound-reply cron kept hitting.
+function inefficientFilter(): ToolError {
+	return new ToolError({
+		userMessage:
+			"Outlook error 400: InefficientFilter: The restriction or sort order is too complex for this operation.",
+		internalMessage:
+			'Graph 400: {"error":{"code":"InefficientFilter","message":"The restriction or sort order is too complex for this operation."}}',
+		status: 400,
+		upstreamName: "Graph",
+	});
+}
+
+function msg(id: string, received: string) {
+	return { id, conversationId: CONV_ID, receivedDateTime: received, subject: id };
+}
+
+describe("paging", () => {
+	it("follows @odata.nextLink until the requested count is met", async () => {
+		vi.mocked(graphGet).mockResolvedValue({
+			value: [msg("a", "2026-08-01T00:00:00Z"), msg("b", "2026-08-02T00:00:00Z")],
+			"@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages?$skip=2",
+		});
+		vi.mocked(graphGetNextLink).mockResolvedValue({
+			value: [msg("c", "2026-08-03T00:00:00Z")],
+		});
+
+		const result = (await getConversationImpl(env, {
+			conversation_id: CONV_ID,
+			count: 25,
+		})) as { count: number; messages: Array<{ id: string }> };
+
+		expect(vi.mocked(graphGetNextLink)).toHaveBeenCalledTimes(1);
+		expect(result.count).toBe(3);
+		expect(result.messages.map((m) => m.id)).toEqual(["a", "b", "c"]);
+	});
+
+	it("stops at the requested count instead of over-collecting", async () => {
+		vi.mocked(graphGet).mockResolvedValue({
+			value: [msg("a", "2026-08-01T00:00:00Z"), msg("b", "2026-08-02T00:00:00Z")],
+			"@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages?$skip=2",
+		});
+
+		const result = (await getConversationImpl(env, {
+			conversation_id: CONV_ID,
+			count: 1,
+		})) as { count: number };
+
+		expect(result.count).toBe(1);
+		expect(vi.mocked(graphGetNextLink)).not.toHaveBeenCalled();
+	});
+
+	it("stops when Graph returns a nextLink but no more rows", async () => {
+		vi.mocked(graphGet).mockResolvedValue({
+			value: [msg("a", "2026-08-01T00:00:00Z")],
+			"@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages?$skip=1",
+		});
+		vi.mocked(graphGetNextLink).mockResolvedValue({ value: [] });
+
+		const result = (await getConversationImpl(env, {
+			conversation_id: CONV_ID,
+			count: 50,
+		})) as { count: number };
+
+		expect(result.count).toBe(1);
+		expect(vi.mocked(graphGetNextLink)).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("InefficientFilter resilience", () => {
+	it("retries with a smaller page when Graph calls the request too expensive", async () => {
+		vi.mocked(graphGet)
+			.mockRejectedValueOnce(inefficientFilter())
+			.mockRejectedValueOnce(inefficientFilter())
+			.mockResolvedValue({ value: [msg("a", "2026-08-01T00:00:00Z")] });
+
+		const result = (await getConversationImpl(env, { conversation_id: CONV_ID })) as {
+			count: number;
+		};
+
+		expect(result.count).toBe(1);
+		const tops = vi
+			.mocked(graphGet)
+			.mock.calls.map((c) => (c[2] as { $top: number }).$top);
+		expect(tops).toEqual([10, 5, 2]);
+	});
+
+	it("gives up only once the page cannot get any smaller", async () => {
+		vi.mocked(graphGet).mockRejectedValue(inefficientFilter());
+
+		await expect(
+			getConversationImpl(env, { conversation_id: CONV_ID }),
+		).rejects.toMatchObject({ status: 400 });
+
+		const tops = vi
+			.mocked(graphGet)
+			.mock.calls.map((c) => (c[2] as { $top: number }).$top);
+		expect(tops).toEqual([10, 5, 2, 1]);
+	});
+
+	// A partial thread is still usable context; a hard failure is not.
+	it("returns what it already has when a later page is refused", async () => {
+		vi.mocked(graphGet).mockResolvedValue({
+			value: [msg("a", "2026-08-01T00:00:00Z"), msg("b", "2026-08-02T00:00:00Z")],
+			"@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages?$skip=2",
+		});
+		vi.mocked(graphGetNextLink).mockRejectedValue(inefficientFilter());
+
+		const result = (await getConversationImpl(env, {
+			conversation_id: CONV_ID,
+			count: 50,
+		})) as { count: number; messages: Array<{ id: string }> };
+
+		expect(result.count).toBe(2);
+		expect(result.messages.map((m) => m.id)).toEqual(["a", "b"]);
+	});
+
+	it("does not swallow unrelated paging failures", async () => {
+		vi.mocked(graphGet).mockResolvedValue({
+			value: [msg("a", "2026-08-01T00:00:00Z")],
+			"@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages?$skip=1",
+		});
+		vi.mocked(graphGetNextLink).mockRejectedValue(
+			new ToolError({ userMessage: "Outlook error 503: ServiceUnavailable", status: 503 }),
+		);
+
+		await expect(
+			getConversationImpl(env, { conversation_id: CONV_ID, count: 50 }),
+		).rejects.toMatchObject({ status: 503 });
 	});
 });
 

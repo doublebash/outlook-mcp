@@ -6,7 +6,7 @@ import {
 	buildRecipients,
 	resolveAndValidateAttachments,
 } from "../email-helpers.js";
-import { graphDelete, graphGet, graphPatch, graphPost } from "../graph.js";
+import { graphDelete, graphGet, graphGetNextLink, graphPatch, graphPost } from "../graph.js";
 import { sanitizeDraftMessage, sanitizeEmailFull, sanitizeEmailList } from "../sanitize.js";
 import {
 	buildBodyWithSignature,
@@ -836,6 +836,93 @@ function sortByReceivedAsc<T extends ConversationMessage>(messages: T[]): T[] {
 	});
 }
 
+// Graph's "the restriction or sort order is too complex for this operation".
+// The code lives in the OData error envelope, which graph.ts folds into both
+// messages, so either carries it.
+function isInefficientFilter(e: unknown): boolean {
+	if (!(e instanceof ToolError)) return false;
+	return /InefficientFilter/i.test(`${e.userMessage} ${e.internalMessage}`);
+}
+
+// Pull a thread out of /me/messages a page at a time.
+//
+// Two separate things provoke `400 InefficientFilter` here, and the tool used to
+// trip both. The first was pairing the conversationId restriction with
+// `$orderby=receivedDateTime asc`: a mailbox has no index serving both at once,
+// and the `ConsistencyLevel: eventual` opt-in the old code leaned on unlocks
+// filter+orderby on directory endpoints, not on /me/messages. That sort now
+// happens in the Worker.
+//
+// The second is page size. /me/messages spans every folder, so Exchange answers
+// the restriction by scanning, and its cost estimate scales with `$top` — it
+// refuses when the requested page is bigger than the matches it can reach
+// cheaply. How deep it has to scan depends on where the thread's messages sit in
+// the mailbox, which is why this failed on some threads and not others, and why
+// a fixed large `$top` would drift back into failing as the mailbox grows. On a
+// live mailbox, one thread was refused at `$top=50` and served at `$top=10`.
+//
+// So: small pages, walked via @odata.nextLink until `count` is satisfied. If
+// Graph still calls a page too expensive, halve the request and retry; a partial
+// thread beats the hard failure that was leaving Sal's cron with no context at
+// all.
+const CONVERSATION_PAGE_SIZE = 10;
+
+interface ConversationPage {
+	value?: ConversationMessage[];
+	"@odata.nextLink"?: string;
+}
+
+async function collectConversationMessages(
+	env: Env,
+	conversationId: string,
+	count: number,
+): Promise<ConversationMessage[]> {
+	const $filter = `conversationId eq '${escapeOdataString(conversationId)}'`;
+	const collected: ConversationMessage[] = [];
+	let nextLink: string | undefined;
+
+	while (collected.length < count) {
+		let page: ConversationPage | null;
+
+		if (nextLink) {
+			// A nextLink has to be followed verbatim (see resolveNextLinkPath), so
+			// there is no smaller page to fall back to — keep what we have.
+			try {
+				page = (await graphGetNextLink(env, nextLink)) as ConversationPage | null;
+			} catch (e) {
+				if (isInefficientFilter(e)) break;
+				throw e;
+			}
+		} else {
+			let top = Math.min(CONVERSATION_PAGE_SIZE, count);
+			for (;;) {
+				try {
+					page = (await graphGet(env, "/me/messages", {
+						$filter,
+						$select: CONVERSATION_SELECT,
+						$top: top,
+					})) as ConversationPage | null;
+					break;
+				} catch (e) {
+					// Nothing collected yet, so there is nothing to degrade to but a
+					// cheaper request. At $top=1 the estimator has no room left to give.
+					if (!isInefficientFilter(e) || top <= 1) throw e;
+					top = Math.max(1, Math.floor(top / 2));
+				}
+			}
+		}
+
+		const batch = Array.isArray(page?.value) ? page.value : [];
+		collected.push(...batch.slice(0, count - collected.length));
+
+		nextLink = page?.["@odata.nextLink"];
+		// No further pages, or Graph stopped returning rows — either way we're done.
+		if (!nextLink || batch.length === 0) break;
+	}
+
+	return collected;
+}
+
 // Both inputs are supported: a message_id is resolved to its thread first.
 async function resolveConversationIdFromMessage(env: Env, messageId: string): Promise<string> {
 	let msg: { conversationId?: string } | null;
@@ -874,27 +961,7 @@ export async function getConversationImpl(
 		Math.max(args.count ?? CONVERSATION_DEFAULT_COUNT, 1),
 		CONVERSATION_MAX_COUNT,
 	);
-	const safeId = escapeOdataString(conversationId);
-
-	// Filter only — no `$orderby`, no `ConsistencyLevel: eventual`. Pairing a
-	// conversationId restriction with a server-side date sort makes Graph reject
-	// the whole request:
-	//
-	//   400 InefficientFilter: The restriction or sort order is too complex for
-	//   this operation.
-	//
-	// A mailbox has no index that serves both at once, and the advanced-query
-	// opt-in that unlocks filter+orderby on directory endpoints does not apply to
-	// /me/messages. A bare conversationId filter is supported and cross-folder
-	// (Graph searches the whole mailbox — inbox, sent, archive), so the shape of
-	// the result is unchanged; only the ordering moves into the Worker below.
-	const data = (await graphGet(env, "/me/messages", {
-		$filter: `conversationId eq '${safeId}'`,
-		$select: CONVERSATION_SELECT,
-		$top: count,
-	})) as { value?: ConversationMessage[] } | null;
-
-	const messages = Array.isArray(data?.value) ? data.value : [];
+	const messages = await collectConversationMessages(env, conversationId, count);
 	if (messages.length === 0) throw ToolError.notFound("Conversation", conversationId);
 
 	return {
