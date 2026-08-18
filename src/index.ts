@@ -19,7 +19,19 @@ import { encodeOneDrivePath } from "./tools/_shared.js";
 import type { Env, OutlookTokenData } from "./types.js";
 
 const SERVER_NAME = "outlook-mcp";
-const SERVER_VERSION = "2.0.0";
+/**
+ * Reported to clients in the MCP handshake. MUST match package.json.
+ *
+ * It drifted to 2.0.0 while package.json reached 2.4.0, so for four releases
+ * every connected client was told it was talking to v2.0.0. Nothing branches on
+ * this value, which is exactly why nobody noticed — but it quietly misleads any
+ * version-specific debugging.
+ *
+ * `test/version.spec.ts` asserts the two stay equal. Bump both together.
+ * It is deliberately NOT imported from package.json: that would inline the whole
+ * manifest (dependency versions, scripts) into the deployed Worker bundle.
+ */
+export const SERVER_VERSION = "2.4.0";
 const SUPPORTED_PROTOCOL_VERSIONS = ["2024-11-05", "2025-03-26"] as const;
 const DEFAULT_PROTOCOL_VERSION: (typeof SUPPORTED_PROTOCOL_VERSIONS)[number] =
 	"2024-11-05";
